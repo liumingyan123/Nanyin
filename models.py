@@ -197,49 +197,9 @@ class SelectiveSSM(nn.Module):
         y = y * self.activation(z)
         return self.out_proj(y)
 
-class MusicMambaProfessional(nn.Module):
-    """
-    专业级 MusicMamba 分类器
-    结合了 Mamba 的长序列建模能力
-    """
-    def __init__(self, input_dim=128, hidden_dim=256, num_classes=3, n_layers=2):
-        super().__init__()
-        # 音频特征投影 (Mel -> Hidden)
-        self.embedding = nn.Linear(input_dim, hidden_dim)
-        
-        # 堆叠 Mamba 层
-        self.layers = nn.ModuleList([
-            SelectiveSSM(d_model=hidden_dim) for _ in range(n_layers)
-        ])
-        
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, num_classes)
-        )
-        
-    def forward(self, x):
-        # x shape: (batch, n_mels, time) -> 转置为 (batch, time, n_mels)
-        x = x.transpose(1, 2)
-        
-        x = self.embedding(x)
-        
-        # 依次通过 Mamba 层
-        for layer in self.layers:
-            x = x + layer(x) # 残差连接
-            
-        x = self.norm(x)
-        
-        # 全局池化 (取时间轴平均)
-        x = x.mean(dim=1)
-        
-        return self.classifier(x)
-
 
 # =================================================================
-# 专业版 BoYaTCN 架构 (基于 Octave Conv + Attention)
+# 八度卷积 (Octave Convolution)：BoYaTCN 论文核心组件之一
 # 模仿 BoYaTCN ，专门针对中国传统音乐设计
 # =================================================================
 
@@ -298,57 +258,6 @@ class OctaveConv1d(nn.Module):
         out_l = l2l + h2l
 
         return out_h, out_l
-
-class BoYaTCNProfessional(nn.Module):
-    """
-    专业版 BoYaTCN
-    融合了 Octave Conv, TCN 和 Self-Attention
-    """
-    def __init__(self, input_dim=128, hidden_dim=256, num_classes=3):
-        super().__init__()
-        # 初始投影层，将 Mel 频谱分为高低频
-        self.in_h = int(hidden_dim * 0.5)
-        self.in_l = hidden_dim - self.in_h
-        
-        self.first_conv = nn.Conv1d(input_dim, hidden_dim, kernel_size=1)
-        
-        # Octave TCN 块
-        self.octave_conv = OctaveConv1d(hidden_dim, hidden_dim, kernel_size=3)
-        
-        # Attention 层
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
-        
-        # BiLSTM 层，增强时序建模
-        self.bilstm = nn.LSTM(hidden_dim, hidden_dim // 2, num_layers=1, bidirectional=True, batch_first=True)
-        
-        self.classifier = nn.Linear(hidden_dim, num_classes)
-        
-    def forward(self, x):
-        # x shape: (batch, n_mels, time)
-        x = self.first_conv(x)
-        
-        # 模拟 Octave 分解
-        x_h = x[:, :self.in_h, :]
-        x_l = F.avg_pool1d(x[:, self.in_h:, :], kernel_size=2, stride=2)
-        
-        # 八度卷积
-        x_h, x_l = self.octave_conv(x_h, x_l)
-        
-        # 合并高低频 (低频上采样)
-        x_l_up = F.interpolate(x_l, size=x_h.size(-1), mode='nearest')
-        x = torch.cat([x_h, x_l_up], dim=1)
-        
-        # Attention (需要转置为 batch, seq, dim)
-        x = x.transpose(1, 2)
-        attn_out, _ = self.attention(x, x, x)
-        x = x + attn_out
-        
-        # BiLSTM
-        x, _ = self.bilstm(x)
-        
-        # 全局池化并分类
-        x = x.mean(dim=1)
-        return self.classifier(x)
 
 
 # =================================================================
