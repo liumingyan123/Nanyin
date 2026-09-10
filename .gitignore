@@ -1,0 +1,74 @@
+# ============================================================
+# 南音项目 .gitignore
+# 原则：只提交模型代码与画图/评估代码，数据、权重、环境全部忽略
+# ============================================================
+
+# ---- Python 环境与缓存 ----
+venv/
+venv38/
+env/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 音频 / MIDI / 视频 / 数据 ----
+*.wav
+*.mp3
+*.flac
+*.mp4
+*.mid
+*.midi
+*.sf2
+*.h5
+*.zip
+*.log
+*.pt
+*.pth
+*.ckpt
+
+# ---- 数据集与结果目录（不上传）----
+南音数据集/
+洞箫/
+二弦/
+三弦/
+PiPa/
+no_vocal/
+test_audio/
+results/
+output/
+refs_best/
+nanyin_multitrack_midi/
+nanyin_gongchepu_midi/
+pdf_collection/
+tessdata_chi_sim/
+tessdata_full/
+# 异常目录：真实名首字符是私用区字符 U+F03A，用通配符匹配
+*Userswin11/
+
+# ---- 训练权重与实验产物 ----
+checkpoints/
+backup_old_csv/
+*.csv
+# backup_pre_causal/ 是旧版模型代码（要上传），只排除其中的权重与产物
+backup_pre_causal/checkpoints/
+backup_pre_causal/old_ckpt_boyatcn/
+backup_pre_causal/old_ckpt_musicmamba/
+backup_pre_causal/run1_earlystop/
+
+# ---- 第三方 / 探索性 / 无关代码 ----
+yourmt3plus/
+midi2.0/
+ddsp_pipa/
+amt_eval_pipeline/
+nanyin_pipeline/
+clews_backend/
+tests/
+*.ipynb
+*.pdf
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.bak
+*.bak_*
