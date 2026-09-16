@@ -1,0 +1,22 @@
+{
+    "typeCheckingMode": "basic",
+    "reportMissingTypeArgument": false,
+    "reportUnknownParameterType": false,
+    "reportUnknownVariableType": false,
+    "reportUnknownMemberType": false,
+    "reportUnknownArgumentType": false,
+    "reportAny": false,
+    "reportUnusedImport": false,
+    "reportUnusedVariable": "warning",
+    "reportUnannotatedClassAttribute": false,
+    "reportImplicitStringConcatenation": false,
+    "reportCallInDefaultInitializer": false,
+    "reportImplicitOverride": false,
+    "reportDeprecated": false,
+    "reportUnusedCallResult": false,
+    "reportIndexIssue": false,
+    "reportPossiblyUnboundVariable": "warning",
+    "reportMissingParameterType": false,
+    "reportCallIssue": false,
+    "reportArgumentType": false
+}

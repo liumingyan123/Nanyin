@@ -201,7 +201,7 @@ def collect_samples():
             for sid in VAL_SONG_IDS:
                 mp = os.path.join(base, subdir, f"{sid}_{subdir}.mid")
                 if not os.path.exists(mp):
-                    print(f"  ⚠ 缺失: {mp}")
+                    print(f" 缺失: {mp}")
                     continue
                 toks, durs, starts, _ = parse_midi_to_sequence(mp)
                 if not toks:
