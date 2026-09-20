@@ -1,0 +1,100 @@
+# E1 阶段配置文件：复合事件（pitch + duration + time-shift）编解码
+# ==============================================================
+#
+# 原则：所有会影响结果的参数集中在本 YAML 中，禁止硬编码散落在各 py 文件。
+# 本阶段（E1）只涉及复合事件定义与 MIDI 往返编解码，不涉及滑窗训练与分布损失消融。
+#
+# 读取方式：
+#     from nanyin_config import load_config
+#     cfg = load_config()
+#     cfg["codec"]["time_unit_sec"]
+
+experiment:
+  name: E1_compound_events
+  branch: feature/compound-events
+  seed: 2026
+  note: "只做复合事件 + MIDI 往返编解码；不训练、不滑窗、不做损失消融"
+
+# ------------------------------------------------------------------------------
+# 复合事件编码：每步一个三元组 (pitch_id, duration_id, shift_id)
+# 序列长度 = 音符数
+#
+# duration / shift 的类别 index 约定（统一公式）：
+#   0                      = PAD / 未定义（伪标签位）
+#   s + 1                  = s 个量化步长，秒数 = s * time_unit_sec   (s < max_steps)
+#   max_steps + 1          = 溢出档（>= max_steps * time_unit_sec）
+# 故两者类别数均为 max_steps + 2
+# ------------------------------------------------------------------------------
+codec:
+  time_unit_sec: 0.02        # 量化网格：20 ms / 步
+  pitch_vocab_size: 128      # MIDI pitch 0~127 直接作为类别 index
+  pitch_min: 0
+  pitch_max: 127
+  # max_steps 取值依据（实测 11 首 GT 的分布，见 reports/E1_selftest_compound_events.md）：
+  #   音符时值最大值 6.89 s / p99.9 ≈ 4.0 s → duration_max_steps = 400 → 精确上限 7.98 s
+  #   相邻 onset 间隔最大值 19.40 s / p99.9 ≈ 3.5 s → shift_max_steps = 1000 → 精确上限 19.98 s
+  # 这样取值使真实数据基本不落入溢出档，往返误差被限制在 ±半格（≤10 ms）以内。
+  # 代价：类别数较多（尾部长尾档几乎无样本），属当前实现的已知局限，见自测报告第 5 节。
+  duration_max_steps: 400    # 精确上限 = 399 * 0.02 = 7.98 s，溢出下界 8.00 s
+  shift_max_steps: 1000      # 精确上限 = 999 * 0.02 = 19.98 s，溢出下界 20.00 s
+  max_notes: 4096            # 单曲最多保留音符数（超出截断，E1 不做滑窗）
+
+# ------------------------------------------------------------------------------
+# 模型结构参数（多属性 embedding 相加 + 三路分类头；E1 仅验证结构、不训练）
+# ------------------------------------------------------------------------------
+model:
+  d_model: 256
+  num_heads: 8
+  num_ssm_layers: 3
+  d_state: 16
+  ssm_expand: 2
+  max_seq_len: 4096
+  dropout: 0.2
+  num_tempo_bins: 20
+  num_modes: 4
+  feat_dim: 13
+  style_dim: 32
+
+# ------------------------------------------------------------------------------
+# 生成阶段采样参数（E1 仅定义；需待复合事件模型训练后才有可用权重）
+# ------------------------------------------------------------------------------
+generation:
+  checkpoint_dir: checkpoints
+  pitch_temperature: 0.9
+  pitch_top_p: 0.92
+  pitch_top_k: 50
+  duration_temperature: 1.0
+  duration_top_p: 0.95
+  duration_top_k: 0          # 0 = 不过滤
+  shift_temperature: 1.0
+  shift_top_p: 0.95
+  shift_top_k: 0
+  default_bpm: 120
+  ticks_per_beat: 480
+  velocity: 80
+  midi_program: 24           # GM program 24 = 尼龙弦吉他，接近南音琵琶拨弦音色
+  max_gen_context_len: 512
+  output_dir: results/generated_midi_compound
+
+# ------------------------------------------------------------------------------
+# 单元自测：MIDI → 复合事件 → 写回 MIDI 往返一致性
+# ------------------------------------------------------------------------------
+selftest:
+  duration_tolerance_sec: 0.02      # 时值往返误差容差（= 1 个量化步长）
+  onset_tolerance_sec: 0.02         # onset 往返误差容差
+  report_path: reports/E1_selftest_compound_events.md
+  tmp_dir: results/e1_roundtrip_tmp
+  songs:                            # 参与自测的曲目（GT = BasicPitch 转录）
+    - dapu01qishouban
+    - dapu02sanmianjinqianjing
+    - dapu03wucaojinqianjing
+    - dapu04bamianjinqianjing
+    - dapu05sishijing
+    - dapu06meihuacao
+    - dapu10sanbuhe
+    - dapu12sijingban
+    - dapu13kongquezhanping
+    - dapu14kouhuangtian
+    - dapu15wujinjiao
+  long_rest_sec: 25.0               # 边界用例：超长休止（> shift 精确上限 19.98 s，检验溢出档局限）
+  long_duration_sec: 12.0           # 边界用例：超长音符（> duration 精确上限 7.98 s）

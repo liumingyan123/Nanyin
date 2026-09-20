@@ -63,7 +63,9 @@ ddsp_pipa/
 amt_eval_pipeline/
 nanyin_pipeline/
 clews_backend/
-tests/
+tests/*
+!tests/*.py
+!tests/__init__.py
 *.ipynb
 *.pdf
 

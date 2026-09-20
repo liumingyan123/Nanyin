@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint  # 必须显式导入子模块，否则 torch.utils.checkpoint.checkpoint 不可用
 import math
+
+from nanyin_config import load_config, get_section
 
 # =================================================================
 # 通用工具：正弦位置编码
@@ -312,6 +315,37 @@ class TemporalConvNet(nn.Module):
 # 南音生成版 BoYaTCN：多输出头适配 NOEF 五维评估体系
 # =================================================================
 
+# =================================================================
+# E1 复合事件输入表示：多属性 embedding 相加
+# 每个时间步同时携带 (pitch, duration, time-shift)，三者各自查表后逐元素相加，
+# 使同一时间步的输入向量同时编码"是什么音 / 多长 / 离上一个音多久"。
+# 这样做的好处：词表规模由 128 变为 128 + 122 + 152 但 embedding 参数线性增长，
+# 且三路属性解耦，便于后续分头监督与分布损失消融（E3+）。
+# =================================================================
+
+def compound_sum_embedding(
+    module: nn.Module,
+    pitch_ids: torch.Tensor,
+    duration_ids: torch.Tensor,
+    shift_ids: torch.Tensor,
+) -> torch.Tensor:
+    """多属性 embedding 相加：E_pitch + E_duration + E_shift。
+
+    参数:
+        module:       含 pitch_embed / duration_embed / shift_embed 的模型
+        pitch_ids:    (B, L) pitch 类别 ID
+        duration_ids: (B, L) duration 类别 ID
+        shift_ids:    (B, L) time-shift 类别 ID
+    返回:
+        (B, L, d_model) 相加后的输入表示
+    """
+    return (
+        module.pitch_embed(pitch_ids)
+        + module.duration_embed(duration_ids)
+        + module.shift_embed(shift_ids)
+    )
+
+
 class NanyinBoYaTCN(nn.Module):
     """
     南音符号旋律生成模型，基于 BoYaTCN 架构扩展多输出头。
@@ -347,26 +381,56 @@ class NanyinBoYaTCN(nn.Module):
         style_dim: int = 32,
         max_seq_len: int = 4096,
         dropout: float = 0.2,
+        pitch_vocab_size: int | None = None,
+        duration_vocab_size: int | None = None,
+        shift_vocab_size: int | None = None,
     ):
         """
         参数:
-            vocab_size:      词汇表大小（MIDI token范围0~127 + 特殊token）
+            vocab_size:      旧链路词汇表大小（MIDI token范围0~127 + 特殊token）
             d_model:         隐藏维度
             num_heads:       注意力头数
             num_tempo_bins:  速度分布分箱数（与 loss_nanyin.py 对齐）
             num_modes:       调式类别数（南音4种专属调式）
             feat_dim:        MFCC特征维度
             style_dim:       风格嵌入维度
-            max_seq_len:     最大序列长度（默认8192，覆盖最长南音曲目~4643音符）
+            max_seq_len:     最大序列长度
             dropout:         Dropout概率
+            pitch_vocab_size / duration_vocab_size / shift_vocab_size:
+                E1 复合事件三路属性词表大小；None 时从 configs/e1_compound_events.yaml 读取
         """
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
 
+        # ---- 复合事件（E1）词表大小：优先取显式入参，回退 YAML 配置 ----
+        # 规则：影响结果的参数不得硬编码，统一来自 configs/e1_compound_events.yaml
+        codec_cfg = get_section("codec")
+        self.pitch_vocab_size = int(
+            pitch_vocab_size if pitch_vocab_size is not None
+            else codec_cfg["pitch_vocab_size"]
+        )
+        self.duration_vocab_size = int(
+            duration_vocab_size if duration_vocab_size is not None
+            else codec_cfg["duration_max_steps"] + 2      # 0=PAD, 1..max 精确档, max+1=溢出档
+        )
+        self.shift_vocab_size = int(
+            shift_vocab_size if shift_vocab_size is not None
+            else codec_cfg["shift_max_steps"] + 2
+        )
+
         # ---- Token嵌入 + 位置编码 ----
         self.token_embed = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.pos_encoding = SinusoidalPositionalEncoding(d_model, max_len=max_seq_len, dropout=dropout)
+
+        # ---- 复合事件三路属性 embedding（相加作为模型输入）----
+        # 每个时间步同时携带 (pitch, duration, time-shift) 三个属性，
+        # 输入表示 = pitch_embed + duration_embed + shift_embed。
+        # 注意：此处不设 padding_idx，避免占用类别 0（duration/shift 的 0 号为
+        # PAD/未定义伪标签）的真实语义；padding 位置应在训练阶段用注意力掩码屏蔽。
+        self.pitch_embed = nn.Embedding(self.pitch_vocab_size, d_model)
+        self.duration_embed = nn.Embedding(self.duration_vocab_size, d_model)
+        self.shift_embed = nn.Embedding(self.shift_vocab_size, d_model)
 
         # ---- OctaveConv 高低频分离参数 ----
         self.in_h = int(d_model * 0.5)
@@ -402,13 +466,21 @@ class NanyinBoYaTCN(nn.Module):
         # ========== 输出头 ==========
 
         # 序列级输出头（per-timestep）
-        self.token_head = nn.Linear(d_model, vocab_size)        # token分类logits
-        self.pitch_head = nn.Linear(d_model, 1)                  # 音高回归
-        self.duration_head = nn.Linear(d_model, 1)              # 时值回归
+        self.token_head = nn.Linear(d_model, vocab_size)        # 旧链路：单 token 分类 logits
+        self.pitch_reg_head = nn.Linear(d_model, 1)              # 旧链路：音高回归
+        self.duration_reg_head = nn.Linear(d_model, 1)           # 旧链路：时值回归
         self.ornament_head = nn.Sequential(                      # 装饰音二分类
             nn.Linear(d_model, 1),
             nn.Sigmoid()
         )
+
+        # E1 复合事件：三路多分类输出头
+        # pitch_head    → pitch 类别（含 PAD/溢出语义见 dataset_nanyin.CompoundEventCodec）
+        # duration_head → duration 档位类别
+        # shift_head    → time-shift 档位类别（末尾为伪标签，训练需掩码）
+        self.pitch_head = nn.Linear(d_model, self.pitch_vocab_size)
+        self.duration_head = nn.Linear(d_model, self.duration_vocab_size)
+        self.shift_head = nn.Linear(d_model, self.shift_vocab_size)
 
         # 全局级输出头（序列均值池化后）
         self.tempo_head = nn.Linear(d_model, num_tempo_bins)    # 速度分布
@@ -416,25 +488,47 @@ class NanyinBoYaTCN(nn.Module):
         self.features_head = nn.Linear(d_model, feat_dim)        # MFCC特征
         self.style_head = nn.Linear(d_model, style_dim)          # 风格嵌入
 
-    def forward(self, input_tokens: torch.Tensor) -> dict:
+    def _embed_input(
+        self,
+        pitch_ids: torch.Tensor,
+        duration_ids: torch.Tensor | None = None,
+        shift_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """输入嵌入：复合事件口径用三路属性 embedding 相加，旧链路退回单 token 嵌入。"""
+        if duration_ids is None or shift_ids is None:
+            return self.token_embed(pitch_ids)
+        return compound_sum_embedding(self, pitch_ids, duration_ids, shift_ids)
+
+    def forward(
+        self,
+        pitch_ids: torch.Tensor,
+        duration_ids: torch.Tensor | None = None,
+        shift_ids: torch.Tensor | None = None,
+    ) -> dict:
         """
-        前向传播。
+        前向传播（支持两种输入口径）。
 
         参数:
-            input_tokens: token ID序列, shape=(batch, seq_len), dtype=long
+            pitch_ids:    复合事件口径下即 pitch 类别 ID，shape=(batch, seq_len), dtype=long；
+                          旧链路口径下为单 token 序列（此时 duration_ids / shift_ids 传 None）
+            duration_ids: duration 类别 ID，shape=(batch, seq_len)；None = 旧链路
+            shift_ids:    time-shift 类别 ID，shape=(batch, seq_len)；None = 旧链路
         返回:
             字典，包含所有预测输出：
-              - "pred_tokens":    (batch, seq_len, vocab_size)
-              - "pred_pitch":     (batch, seq_len)
-              - "pred_duration":  (batch, seq_len)
+              - "pred_tokens":    (batch, seq_len, vocab_size)        旧链路单 token logits
+              - "pred_pitch":     (batch, seq_len)                    旧链路音高回归
+              - "pred_duration":  (batch, seq_len)                    旧链路时值回归
               - "pred_ornament":  (batch, seq_len)
+              - "pred_pitch_logits":    (batch, seq_len, pitch_vocab_size)      E1 复合事件
+              - "pred_duration_logits": (batch, seq_len, duration_vocab_size)   E1 复合事件
+              - "pred_shift_logits":    (batch, seq_len, shift_vocab_size)      E1 复合事件
               - "pred_tempo_dist": (batch, num_tempo_bins)
               - "pred_mode_logits": (batch, num_modes)
               - "pred_features":   (batch, feat_dim)
               - "pred_style":      (batch, style_dim)
         """
-        # ---- 1. Token Embedding ---- (batch, seq_len) → (batch, seq_len, d_model)
-        x = self.token_embed(input_tokens)  # (B, L, d_model)
+        # ---- 1. Embedding ---- (batch, seq_len) → (batch, seq_len, d_model)
+        x = self._embed_input(pitch_ids, duration_ids, shift_ids)  # (B, L, d_model)
         x = x * math.sqrt(self.d_model)     # 缩放嵌入（Transformer标准做法）
 
         # ---- 2. 位置编码 ----
@@ -475,10 +569,15 @@ class NanyinBoYaTCN(nn.Module):
         x = self.norm3(x)
 
         # ---- 6. 序列级输出 ----
-        pred_tokens = self.token_head(x)                   # (B, L, vocab_size)
-        pred_pitch = self.pitch_head(x).squeeze(-1)        # (B, L)
-        pred_duration = F.softplus(self.duration_head(x).squeeze(-1))  # (B, L) 正值约束
+        pred_tokens = self.token_head(x)                   # (B, L, vocab_size)  旧链路
+        pred_pitch = self.pitch_reg_head(x).squeeze(-1)    # (B, L)  旧链路音高回归
+        pred_duration = F.softplus(self.duration_reg_head(x).squeeze(-1))  # (B, L) 正值约束
         pred_ornament = self.ornament_head(x).squeeze(-1)  # (B, L) in [0,1]
+
+        # E1 复合事件：三路多分类 logits（相邻属性同时预测，序列仅向前推进一个事件）
+        pred_pitch_logits = self.pitch_head(x)             # (B, L, pitch_vocab_size)
+        pred_duration_logits = self.duration_head(x)       # (B, L, duration_vocab_size)
+        pred_shift_logits = self.shift_head(x)             # (B, L, shift_vocab_size)
 
         # ---- 7. 全局级输出（序列均值池化）----
         x_global = x.mean(dim=1)                           # (B, d_model)
@@ -492,6 +591,9 @@ class NanyinBoYaTCN(nn.Module):
             "pred_pitch":       pred_pitch,
             "pred_duration":    pred_duration,
             "pred_ornament":    pred_ornament,
+            "pred_pitch_logits":    pred_pitch_logits,
+            "pred_duration_logits": pred_duration_logits,
+            "pred_shift_logits":    pred_shift_logits,
             "pred_tempo_dist":  pred_tempo_dist,
             "pred_mode_logits": pred_mode_logits,
             "pred_features":    pred_features,
@@ -546,10 +648,13 @@ class NanyinMusicMamba(nn.Module):
         style_dim: int = 32,
         max_seq_len: int = 4096,
         dropout: float = 0.2,
+        pitch_vocab_size: int | None = None,
+        duration_vocab_size: int | None = None,
+        shift_vocab_size: int | None = None,
     ):
         """
         参数:
-            vocab_size:      词汇表大小（MIDI token范围0~127 + 特殊token）
+            vocab_size:      旧链路词汇表大小（MIDI token范围0~127 + 特殊token）
             d_model:         隐藏维度
             num_layers:      SelectiveSSM 层数
             d_state:         SSM 状态维度
@@ -558,16 +663,39 @@ class NanyinMusicMamba(nn.Module):
             num_modes:       调式类别数（南音4种专属调式）
             feat_dim:        MFCC特征维度
             style_dim:       风格嵌入维度
-            max_seq_len:     最大序列长度（默认8192，覆盖最长南音曲目~4643音符）
+            max_seq_len:     最大序列长度
             dropout:         Dropout概率
+            pitch_vocab_size / duration_vocab_size / shift_vocab_size:
+                E1 复合事件三路属性词表大小；None 时从 configs/e1_compound_events.yaml 读取
         """
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
 
+        # ---- 复合事件（E1）词表大小：优先取显式入参，回退 YAML 配置 ----
+        codec_cfg = get_section("codec")
+        self.pitch_vocab_size = int(
+            pitch_vocab_size if pitch_vocab_size is not None
+            else codec_cfg["pitch_vocab_size"]
+        )
+        self.duration_vocab_size = int(
+            duration_vocab_size if duration_vocab_size is not None
+            else codec_cfg["duration_max_steps"] + 2
+        )
+        self.shift_vocab_size = int(
+            shift_vocab_size if shift_vocab_size is not None
+            else codec_cfg["shift_max_steps"] + 2
+        )
+
         # ---- Token嵌入 + 位置编码 ----
         self.token_embed = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.pos_encoding = SinusoidalPositionalEncoding(d_model, max_len=max_seq_len, dropout=dropout)
+
+        # ---- 复合事件三路属性 embedding（相加作为模型输入）----
+        # 同 BoYaTCN：不设 padding_idx，避免占用类别 0 的原有语义（PAD / 伪标签位）。
+        self.pitch_embed = nn.Embedding(self.pitch_vocab_size, d_model)
+        self.duration_embed = nn.Embedding(self.duration_vocab_size, d_model)
+        self.shift_embed = nn.Embedding(self.shift_vocab_size, d_model)
 
         # ---- 堆叠 SelectiveSSM 层 ----
         # Mamba 的线性 O(N) 复杂度适合南音长曲目的序列建模（文献：KAD arXiv:2502.15602）
@@ -585,13 +713,18 @@ class NanyinMusicMamba(nn.Module):
         # ========== 输出头（与 NanyinBoYaTCN 完全一致） ==========
 
         # 序列级输出头（per-timestep）
-        self.token_head = nn.Linear(d_model, vocab_size)        # token分类logits
-        self.pitch_head = nn.Linear(d_model, 1)                  # 音高回归
-        self.duration_head = nn.Linear(d_model, 1)              # 时值回归
+        self.token_head = nn.Linear(d_model, vocab_size)        # 旧链路：单 token 分类 logits
+        self.pitch_reg_head = nn.Linear(d_model, 1)              # 旧链路：音高回归
+        self.duration_reg_head = nn.Linear(d_model, 1)           # 旧链路：时值回归
         self.ornament_head = nn.Sequential(                      # 装饰音二分类
             nn.Linear(d_model, 1),
             nn.Sigmoid()
         )
+
+        # E1 复合事件：三路多分类输出头（与 BoYaTCN 完全对齐）
+        self.pitch_head = nn.Linear(d_model, self.pitch_vocab_size)
+        self.duration_head = nn.Linear(d_model, self.duration_vocab_size)
+        self.shift_head = nn.Linear(d_model, self.shift_vocab_size)
 
         # 全局级输出头（序列均值池化后）
         self.tempo_head = nn.Linear(d_model, num_tempo_bins)    # 速度分布
@@ -599,25 +732,47 @@ class NanyinMusicMamba(nn.Module):
         self.features_head = nn.Linear(d_model, feat_dim)        # MFCC特征
         self.style_head = nn.Linear(d_model, style_dim)          # 风格嵌入
 
-    def forward(self, input_tokens: torch.Tensor) -> dict:
+    def _embed_input(
+        self,
+        pitch_ids: torch.Tensor,
+        duration_ids: torch.Tensor | None = None,
+        shift_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """输入嵌入：复合事件口径用三路属性 embedding 相加，旧链路退回单 token 嵌入。"""
+        if duration_ids is None or shift_ids is None:
+            return self.token_embed(pitch_ids)
+        return compound_sum_embedding(self, pitch_ids, duration_ids, shift_ids)
+
+    def forward(
+        self,
+        pitch_ids: torch.Tensor,
+        duration_ids: torch.Tensor | None = None,
+        shift_ids: torch.Tensor | None = None,
+    ) -> dict:
         """
-        前向传播。
+        前向传播（支持两种输入口径）。
 
         参数:
-            input_tokens: token ID序列, shape=(batch, seq_len), dtype=long
+            pitch_ids:    复合事件口径下即 pitch 类别 ID，shape=(batch, seq_len), dtype=long；
+                          旧链路口径下为单 token 序列（此时 duration_ids / shift_ids 传 None）
+            duration_ids: duration 类别 ID，shape=(batch, seq_len)；None = 旧链路
+            shift_ids:    time-shift 类别 ID，shape=(batch, seq_len)；None = 旧链路
         返回:
             字典，包含所有预测输出（与 NanyinBoYaTCN.forward() 输出结构完全一致）：
               - "pred_tokens":     (batch, seq_len, vocab_size)
               - "pred_pitch":      (batch, seq_len)
               - "pred_duration":   (batch, seq_len)
               - "pred_ornament":   (batch, seq_len)
+              - "pred_pitch_logits":    (batch, seq_len, pitch_vocab_size)     E1 复合事件
+              - "pred_duration_logits": (batch, seq_len, duration_vocab_size)  E1 复合事件
+              - "pred_shift_logits":    (batch, seq_len, shift_vocab_size)     E1 复合事件
               - "pred_tempo_dist":  (batch, num_tempo_bins)
               - "pred_mode_logits": (batch, num_modes)
               - "pred_features":    (batch, feat_dim)
               - "pred_style":       (batch, style_dim)
         """
-        # ---- 1. Token Embedding ---- (batch, seq_len) → (batch, seq_len, d_model)
-        x = self.token_embed(input_tokens)  # (B, L, d_model)
+        # ---- 1. Embedding ---- (batch, seq_len) → (batch, seq_len, d_model)
+        x = self._embed_input(pitch_ids, duration_ids, shift_ids)  # (B, L, d_model)
         x = x * math.sqrt(self.d_model)     # 缩放嵌入
 
         # ---- 2. 位置编码 ----
@@ -631,10 +786,15 @@ class NanyinMusicMamba(nn.Module):
             x = self.norm(x)                 # 层归一化
 
         # ---- 4. 序列级输出 ----
-        pred_tokens = self.token_head(x)                   # (B, L, vocab_size)
-        pred_pitch = self.pitch_head(x).squeeze(-1)        # (B, L)
-        pred_duration = F.softplus(self.duration_head(x).squeeze(-1))  # (B, L) 正值约束
+        pred_tokens = self.token_head(x)                   # (B, L, vocab_size)  旧链路
+        pred_pitch = self.pitch_reg_head(x).squeeze(-1)    # (B, L)  旧链路音高回归
+        pred_duration = F.softplus(self.duration_reg_head(x).squeeze(-1))  # (B, L) 正值约束
         pred_ornament = self.ornament_head(x).squeeze(-1)  # (B, L) in [0,1]
+
+        # E1 复合事件：三路多分类 logits
+        pred_pitch_logits = self.pitch_head(x)             # (B, L, pitch_vocab_size)
+        pred_duration_logits = self.duration_head(x)       # (B, L, duration_vocab_size)
+        pred_shift_logits = self.shift_head(x)             # (B, L, shift_vocab_size)
 
         # ---- 5. 全局级输出（序列均值池化）----
         x_global = x.mean(dim=1)                           # (B, d_model)
@@ -648,6 +808,9 @@ class NanyinMusicMamba(nn.Module):
             "pred_pitch":       pred_pitch,
             "pred_duration":    pred_duration,
             "pred_ornament":    pred_ornament,
+            "pred_pitch_logits":    pred_pitch_logits,
+            "pred_duration_logits": pred_duration_logits,
+            "pred_shift_logits":    pred_shift_logits,
             "pred_tempo_dist":  pred_tempo_dist,
             "pred_mode_logits": pred_mode_logits,
             "pred_features":    pred_features,

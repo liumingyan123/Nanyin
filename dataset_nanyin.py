@@ -37,7 +37,7 @@ dataset_nanyin.py - 南音数据集自定义PyTorch Dataset工具
 import os
 import json
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -47,6 +47,8 @@ try:
     import pretty_midi  # 解析 BasicPitch 转录 midi（训练数据源）
 except ImportError:
     pretty_midi = None
+
+from nanyin_config import load_config, get_section
 
 
 # ==============================================================================
@@ -224,6 +226,237 @@ def load_song_annotations(song_id: str, base_dir: str = _DATASET_BASE) -> Option
 
 
 # ==============================================================================
+# 三之二、复合事件编解码器（E1：pitch + duration + time-shift）
+# ==============================================================================
+
+class CompoundEventCodec:
+    """音符级复合事件（pitch + duration + time-shift）编解码器。
+
+    事件组织方式：**每个音符一个三元组**，序列长度 = 音符数
+
+        第 i 步事件 = (pitch_id_i, duration_id_i, shift_id_i)
+
+      - pitch_id    : MIDI 音高，直接作为类别 index（词表大小 128，见 yaml: codec.pitch_vocab_size）
+      - duration_id : 该音符时值（秒）量化到 time_unit_sec 网格后的类别 index
+      - shift_id    : 该音符 onset 到**下一个音符** onset 的间隔（time-shift，秒）类别 index
+                      ⇒ onset_{i+1} = onset_i + shift_i，即**前向 IOI**（见下方"time-shift 方向约定"）
+
+    duration / shift 的类别 index 约定（统一公式，见 yaml: codec.*_max_steps）：
+
+        ==========================================================
+         index                     含义
+        ==========================================================
+         0                         PAD / 未定义（伪标签位）
+         s + 1                     s 个量化步长，秒数 = s * time_unit_sec，s < max_steps
+         max_steps + 1             溢出档（>= max_steps * time_unit_sec）
+        ==========================================================
+
+        故类别数 = max_steps + 2。溢出档解码时只能还原为下界值 max_steps * time_unit_sec。
+
+    time-shift 方向约定（重要，决定了哪个位置是伪标签）：
+        采用**前向 IOI**：shift_i = onset_{i+1} - onset_i。
+        由此保证"末尾位置的 time-shift 无真实监督目标"这一性质成立
+        （最后一个音符之后没有下一个音符），且解码时先落音符再累加 Shift，
+        天然与自回归生成的顺序一致：第 i 步采样出的 shift 决定第 i+1 个音的位置，
+        不存在未来信息泄漏。
+
+    ⚠ 已知局限（本阶段明确记录，后续阶段再处理，勿在此处悄悄绕过）：
+      1) **序列末尾 time-shift 为伪标签**：最后一个音符之后不存在"下一个音符"，
+         其 time-shift 没有真实监督目标，统一置 0（未定义位）。
+         ⇒ 计算 time-shift 损失时必须对该位置置掩码，否则会引入错误的监督信号。
+         ⇒ 窗口/切片切尾时同理：窗口末尾假想的"再下一个音符"并不存在，
+            该 time-shift 一律为伪标签。
+      2) **对长休止表达存在局限**：相邻 onset 间隔 >= max_steps * time_unit_sec
+         （当前 yaml: 1000 * 0.02 = 20.00 s）时，全部被压缩到同一个溢出档，解码只能还原
+         为 20.00 s 下界，无法表达确切休止长度；音符时值同理（>= 8.00 s 溢出）。
+         ⇒ 一旦发生溢出，其后所有音符的 onset 会被永久性地向前平移（误差累积），
+            具体误差分布见 reports/E1_selftest_compound_events.md。
+    """
+
+    def __init__(self, cfg: Optional[dict] = None):
+        codec_cfg = dict(cfg if cfg is not None else get_section("codec"))
+        self.time_unit_sec: float = float(codec_cfg["time_unit_sec"])
+        self.pitch_vocab_size: int = int(codec_cfg["pitch_vocab_size"])
+        self.pitch_min: int = int(codec_cfg["pitch_min"])
+        self.pitch_max: int = int(codec_cfg["pitch_max"])
+        self.duration_max_steps: int = int(codec_cfg["duration_max_steps"])
+        self.shift_max_steps: int = int(codec_cfg["shift_max_steps"])
+        self.max_notes: int = int(codec_cfg["max_notes"])
+
+        # 0 号保留给 PAD / 未定义，末档为溢出档
+        self.duration_num_classes: int = self.duration_max_steps + 2
+        self.shift_num_classes: int = self.shift_max_steps + 2
+
+    # ---------- 量化 ↔ 秒(或步) ----------
+
+    def seconds_to_steps(self, seconds: float) -> int:
+        """秒 → 量化步数（四舍五入到最近网格，负值截断为 0）。"""
+        return max(0, int(round(float(seconds) / self.time_unit_sec)))
+
+    def steps_to_seconds(self, steps: int) -> float:
+        """量化步数 → 秒。"""
+        return float(steps) * self.time_unit_sec
+
+    def _class_from_steps(self, steps: int, max_steps: int) -> int:
+        """量化步数 → 类别 index（0=PAD；1..max_steps 为精确档；max_steps+1=溢出）。"""
+        steps = max(0, int(steps))
+        if steps >= max_steps:
+            return max_steps + 1          # 溢出档
+        return steps + 1
+
+    def _value_to_class(self, seconds: float, max_steps: int) -> int:
+        """秒 → 类别 index（0=PAD；1..max_steps 为 s+1 映射；max_steps+1=溢出）。"""
+        return self._class_from_steps(self.seconds_to_steps(seconds), max_steps)
+
+    def _class_to_steps(self, cls: int, max_steps: int) -> int:
+        """类别 index → 量化步数（溢出档还原为下界，PAD 还原为 0）。"""
+        if cls <= 0:
+            return 0
+        return int(min(cls - 1, max_steps))
+
+    def duration_to_index(self, duration_sec: float) -> int:
+        """时值（秒）→ duration 类别 index。"""
+        return self._value_to_class(duration_sec, self.duration_max_steps)
+
+    def index_to_duration(self, idx: int) -> float:
+        """duration 类别 index → 时值（秒）。"""
+        return self.steps_to_seconds(self._class_to_steps(int(idx), self.duration_max_steps))
+
+    def shift_to_index(self, shift_sec: float) -> int:
+        """time-shift（秒）→ shift 类别 index。0 秒的气口/同时发音 = index 1。"""
+        return self._value_to_class(shift_sec, self.shift_max_steps)
+
+    def index_to_shift(self, idx: int) -> float:
+        """shift 类别 index → time-shift（秒）。"""
+        return self.steps_to_seconds(self._class_to_steps(int(idx), self.shift_max_steps))
+
+    # ---------- 序列级编解码 ----------
+
+    def encode_notes(self, notes: List[dict]) -> Dict[str, Any]:
+        """音符列表 → 三路复合事件 ID 序列。
+
+        参数:
+            notes: [{"note": int, "duration": float, "start_time": float, "velocity": int}, ...]
+                   需按 (start_time, pitch) 升序（load_song_annotations 已保证）
+        返回:
+            {
+              "pitch_ids":    List[int],   # 长度 = 音符数
+              "duration_ids": List[int],
+              "shift_ids":    List[int],   # 前向 IOI：shift_i = onset_{i+1} - onset_i；末音符 = 0（伪标签）
+              "stats": {...}               # 溢出等统计，便于自测报告量化局限
+            }
+        """
+        pitch_ids: List[int] = []
+        duration_ids: List[int] = []
+        shift_ids: List[int] = []
+
+        truncated = 0
+        duration_overflow = 0
+        shift_overflow = 0
+        negative_gap = 0
+
+        use_notes = notes[: self.max_notes]
+        truncated = len(notes) - len(use_notes)
+
+        # 前向 IOI：先算出每个音符量化后的**绝对 onset**，再按 shift_i = q_{i+1} - q_i 作差。
+        #   这样做的原因：若对每个原始间隔独立量化再分类，各处 ±半格的舍入误差会在解码
+        #   累加时形成单向漂移（实测千音符级曲目的累计 onset 误差可达数秒）；用"量化后
+        #   绝对位置作差"可让每个音符的 onset 误差被限制在半格以内，且不随序列长度累积。
+        quant_starts = [
+            self.seconds_to_steps(float(n.get("start_time", 0.0))) for n in use_notes
+        ]
+
+        for i, note in enumerate(use_notes):
+            pitch = int(np.clip(int(note.get("note", 60)), self.pitch_min, self.pitch_max))
+            duration = float(note.get("duration", 0.5))
+
+            if i == len(use_notes) - 1:
+                # ⚠ 伪标签：末尾音符之后不存在"下一个音符"，time-shift 无真实监督目标，
+                #   统一置 0（未定义位）。训练时必须对该位置做掩码，不计入损失。
+                shift_index = 0
+            else:
+                gap_steps = quant_starts[i + 1] - quant_starts[i]
+                if gap_steps < 0:
+                    # 多轨合并/音符重叠可能产生负间隔，截断为 0 并计数
+                    negative_gap += 1
+                    gap_steps = 0
+                # 用"步数"而非"秒"分类，避免二次量化误差
+                shift_index = self._class_from_steps(gap_steps, self.shift_max_steps)
+
+            duration_index = self.duration_to_index(duration)
+            if duration_index == self.duration_max_steps + 1:
+                duration_overflow += 1
+            if shift_index == self.shift_max_steps + 1:
+                shift_overflow += 1
+
+            pitch_ids.append(pitch)
+            duration_ids.append(duration_index)
+            shift_ids.append(shift_index)
+
+        stats = {
+            "num_notes": len(pitch_ids),
+            "truncated_notes": truncated,
+            "duration_overflow": duration_overflow,
+            "shift_overflow": shift_overflow,
+            "negative_gap_clamped": negative_gap,
+        }
+
+        return {
+            "pitch_ids": pitch_ids,
+            "duration_ids": duration_ids,
+            "shift_ids": shift_ids,
+            "stats": stats,
+        }
+
+    def decode_events(
+        self,
+        pitch_ids: List[int],
+        duration_ids: List[int],
+        shift_ids: List[int],
+        start_offset_sec: float = 0.0,
+    ) -> List[dict]:
+        """复合事件序列 → 音符列表（onset 由 time-shift 累加得到）。
+
+        onset 递推（前向 IOI 约定）：
+            onset_0    = start_offset_sec
+            onset_{i+1} = onset_i + index_to_shift(shift_ids[i])
+        即**先落当前音符，再用当前位置的 shift 推进到下一个音符**。
+        末尾 shift_ids[-1] 为伪标签 0，不参与 onset 计算（最后一个音符已经落地）。
+
+        参数:
+            pitch_ids / duration_ids / shift_ids: 三路等长 ID 序列
+            start_offset_sec: 首个音符的 onset（秒），默认 0
+        返回:
+            [{"note": int, "duration": float, "start_time": float}, ...]
+        """
+        n = min(len(pitch_ids), len(duration_ids), len(shift_ids))
+        decoded: List[dict] = []
+        cur_start = float(start_offset_sec)
+        for i in range(n):
+            decoded.append({
+                "note": int(np.clip(int(pitch_ids[i]), self.pitch_min, self.pitch_max)),
+                "duration": self.index_to_duration(int(duration_ids[i])),
+                "start_time": cur_start,
+            })
+            cur_start += self.index_to_shift(int(shift_ids[i]))
+        return decoded
+
+
+_DEFAULT_CODEC: Optional["CompoundEventCodec"] = None
+
+
+def get_compound_codec(cfg: Optional[dict] = None, reload: bool = False) -> CompoundEventCodec:
+    """获取默认复合事件编解码器（参数来自 configs/e1_compound_events.yaml）。"""
+    global _DEFAULT_CODEC
+    if reload or _DEFAULT_CODEC is None or cfg is not None:
+        codec = CompoundEventCodec(cfg)
+        if cfg is None:
+            _DEFAULT_CODEC = codec
+        return codec
+    return _DEFAULT_CODEC
+
+
+# ==============================================================================
 # 四、标注 → 统一真值特征字典 转换（纯 MIDI 客观推导）
 # ==============================================================================
 
@@ -347,7 +580,8 @@ def build_target_dict(annotations: Dict[str, dict]) -> Dict[str, torch.Tensor]:
     pitch_list: List[float] = []       # MIDI音高值
     duration_list: List[float] = []    # 时值（秒）
     start_list: List[float] = []       # 起始时间（秒）
-    token_list: List[int] = []         # token ID序列
+    token_list: List[int] = []         # token ID序列（旧：仅 pitch 单 token）
+    note_items: List[dict] = []        # 原始音符 dict 列表（供复合事件编码器使用）
 
     tracks = midi_data.get("tracks", [])
     # 优先使用主旋律轨道（琵琶/骨音），其次取第一个轨道
@@ -371,6 +605,11 @@ def build_target_dict(annotations: Dict[str, dict]) -> Dict[str, torch.Tensor]:
             # 将MIDI pitch直接作为token ID（范围21~108，共88个可能值）
             # 映射到 vocab_size=128 的词表中，保留扩展空间
             token_list.append(int(np.clip(pitch, 0, 127)))
+            note_items.append({
+                "note": int(np.clip(pitch, 0, 127)),
+                "duration": float(duration),
+                "start_time": float(start),
+            })
 
     # 若MIDI轨道无音符，构造一个占位序列（至少1个元素以保证模型不崩溃）
     if len(token_list) == 0:
@@ -379,6 +618,7 @@ def build_target_dict(annotations: Dict[str, dict]) -> Dict[str, torch.Tensor]:
         pitch_list.append(60.0)
         duration_list.append(1.0)
         start_list.append(0.0)
+        note_items.append({"note": 60, "duration": 1.0, "start_time": 0.0})
 
     target_tokens   = torch.tensor(token_list, dtype=torch.long)      # (seq_len,)
     target_pitch    = torch.tensor(pitch_list, dtype=torch.float32)   # (seq_len,)
@@ -429,6 +669,14 @@ def build_target_dict(annotations: Dict[str, dict]) -> Dict[str, torch.Tensor]:
     style_vec = style_vec / (np.linalg.norm(style_vec) + 1e-8)
     target_style = torch.tensor(style_vec, dtype=torch.float32)                # (style_dim,)
 
+    # ---- 6.5 复合事件（E1）：(pitch, duration, time-shift) 三路类别序列 ----
+    #   每音符一个三元组，长度与 token 序列一致；target_tokens 仅为兼容旧链路保留。
+    codec = get_compound_codec()
+    events = codec.encode_notes(note_items)
+    target_pitch_ids = torch.tensor(events["pitch_ids"], dtype=torch.long)      # (seq_len,)
+    target_duration_ids = torch.tensor(events["duration_ids"], dtype=torch.long)  # (seq_len,)
+    target_shift_ids = torch.tensor(events["shift_ids"], dtype=torch.long)      # (seq_len,)
+
     # ---- 7. 组装完整 target_dict ----
     target_dict = {
         # 序列级（逐音符）真值
@@ -436,6 +684,10 @@ def build_target_dict(annotations: Dict[str, dict]) -> Dict[str, torch.Tensor]:
         "target_pitch":    target_pitch,
         "target_duration": target_duration,
         "target_ornament": target_ornament,
+        # 复合事件三路类别 ID（E1 新增；末尾 shift 为伪标签，后续训练需掩码）
+        "target_pitch_ids":    target_pitch_ids,
+        "target_duration_ids": target_duration_ids,
+        "target_shift_ids":    target_shift_ids,
         # 全局级真值
         "target_tempo_dist": target_tempo_dist,
         "target_mode_dist":  target_mode_dist,
@@ -534,7 +786,10 @@ class NanyinDataset(Dataset):
         target_dict = build_target_dict(annotations)
 
         # 按 max_seq_len 截断序列级字段（避免超出位置编码长度）
-        seq_keys = ["target_tokens", "target_pitch", "target_duration", "target_ornament"]
+        seq_keys = [
+            "target_tokens", "target_pitch", "target_duration", "target_ornament",
+            "target_pitch_ids", "target_duration_ids", "target_shift_ids",
+        ]
         for key in seq_keys:
             if key in target_dict and target_dict[key].shape[0] > self.max_seq_len:
                 print(f"[dataset_nanyin] 曲目 [{self.song_ids[idx]}] {key} 长度 {target_dict[key].shape[0]} > {self.max_seq_len}，已截断")
@@ -682,20 +937,28 @@ def collate_nanyin_batch(
     batch_size = len(batch)
 
     # 序列级字段（需要 padding）
+    # dtype：类别 ID 一律 long，连续值（音高/时值/装饰音）一律 float32
     seq_keys = [
-        "input_tokens",    # 输入token
+        "input_tokens",    # 输入token（旧：仅 pitch 单 token）
         "target_tokens",   # 目标token
-        "target_pitch",    # 音高
-        "target_duration", # 时值
+        "target_pitch",    # 音高（连续值）
+        "target_duration", # 时值（连续值）
         "target_ornament", # 装饰音标记
+        "target_pitch_ids",     # 复合事件：pitch 类别 ID
+        "target_duration_ids",  # 复合事件：duration 类别 ID
+        "target_shift_ids",     # 复合事件：time-shift 类别 ID
     ]
+    long_keys = {
+        "input_tokens", "target_tokens",
+        "target_pitch_ids", "target_duration_ids", "target_shift_ids",
+    }
 
     batched_target: Dict[str, torch.Tensor] = {}
     batched_input_tokens = torch.empty(0)  # 初始化，避免未绑定警告
 
     for key in seq_keys:
         is_key_input = (key == "input_tokens")
-        padded = torch.zeros(batch_size, max_len, dtype=torch.long if "tokens" in key else torch.float32)
+        padded = torch.zeros(batch_size, max_len, dtype=torch.long if key in long_keys else torch.float32)
         for b_idx, (input_tok, tgt_dict) in enumerate(batch):
             if is_key_input:
                 seq = input_tok
