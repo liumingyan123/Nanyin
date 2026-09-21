@@ -30,6 +30,10 @@ codec:
   pitch_vocab_size: 128      # MIDI pitch 0~127 直接作为类别 index
   pitch_min: 0
   pitch_max: 127
+  # E2 起：每路词表在真实类别之上追加 BOS / EOS 两个特殊 token（id 见
+  # dataset_nanyin.CompoundEventCodec 的 *_bos_id / *_eos_id）。
+  # 三路词表总大小 = 真实类别数 + num_special_tokens。
+  num_special_tokens: 2
   # max_steps 取值依据（实测 11 首 GT 的分布，见 reports/E1_selftest_compound_events.md）：
   #   音符时值最大值 6.89 s / p99.9 ≈ 4.0 s → duration_max_steps = 400 → 精确上限 7.98 s
   #   相邻 onset 间隔最大值 19.40 s / p99.9 ≈ 3.5 s → shift_max_steps = 1000 → 精确上限 19.98 s

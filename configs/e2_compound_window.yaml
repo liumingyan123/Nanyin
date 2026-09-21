@@ -1,0 +1,74 @@
+# E2 阶段配置文件：复合事件滑窗样本构建 + BoYaTCN 窗口训练
+# ==============================================================
+#
+# 本文件是**覆盖层**：未在此处声明的字段一律回退到基础配置
+# ``configs/e1_compound_events.yaml``（nanyin_config.load_config 做深合并）。
+# 这样 codec / model / generation 等 E1 已固化的参数只有一份真源，避免双份维护漂移。
+#
+# 读取方式：
+#     from nanyin_config import load_config
+#     cfg = load_config("configs/e2_compound_window.yaml")
+#
+# 本阶段硬性约束（来自 E1 自测报告，不可忽略）：
+#   1) 窗口最后一个事件的 time-shift 是伪标签 → 训练 loss 用 ignore_index 掩码屏蔽
+#   2) 训练过程输出 duration / time-shift 词表长尾类别频次统计日志
+#   3) 日志打印所有被 max_notes 截断的曲目清单
+#   4) GT（BasicPitch 转录）同音重叠导致前音符时值被截断的噪声来源已写入 dataset_nanyin.py 注释
+
+experiment:
+  name: E2_compound_window
+  branch: feature/E2_compound_window
+  seed: 2026
+  note: "复合事件 256 事件窗口切分 + BoYaTCN 三输出头训练；损失仅 pitch/duration/shift 三路 CE，不做 L0-L5 消融"
+
+# ------------------------------------------------------------------------------
+# 窗口切分（E2 核心）
+#   窗口长度单位 = **事件数**（复合事件序列长度），不是音符时间长度
+#   - 训练集：滑动窗口，步长 128（50% 重叠）
+#   - 验证/测试集：非重叠取样，步长 = 窗口长度 256
+#   - 不足 window_size_events 的尾窗直接丢弃（drop_tail: true），不做 padding
+#   - 曲目 ID 隔离：窗口按曲目切分，训练集/验证集曲目 ID 完全不相交
+# ------------------------------------------------------------------------------
+window:
+  window_size_events: 256
+  train_stride_events: 128
+  eval_stride_events: 256
+  drop_tail: true
+
+# ------------------------------------------------------------------------------
+# 训练超参（BoYaTCN 窗口训练）
+#   损失：total = 1.0 * pitch_CE + 0.7 * duration_CE + 0.7 * shift_CE
+#   早停监控量：验证集 total loss（越低越好），保存 best-val checkpoint
+# ------------------------------------------------------------------------------
+training:
+  num_epochs: 200
+  batch_size: 16
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  lr_step_size: 50
+  lr_gamma: 0.5
+  early_stop_patience: 20        # 验证集 total loss 连续 N 轮未下降则终止
+  shuffle: true
+  num_workers: 0
+  loss_weight_pitch: 1.0
+  loss_weight_duration: 0.7
+  loss_weight_shift: 0.7
+  checkpoint_dir: checkpoints/e2_boyatcn
+  best_ckpt_name: best_valloss_model.pt
+  periodic_ckpt_every: 20        # 每 N 轮另存一份 checkpoint（0 = 不另存）
+
+  # ---- 词表类别统计日志（监控 duration / time-shift 长尾类别）----
+  vocab_log_every_epochs: 10     # 每 N 轮打印一次长尾摘要（完整分布只在训练开始时打印一次）
+  long_tail_threshold: 5         # 出现频次 <= 该值计为"长尾类别"
+  top_k_classes: 10              # 打印频次最高的 K 个类别
+
+# ------------------------------------------------------------------------------
+# E2 产物路径（均在 results/ 下，被 .gitignore 排除，不入库）
+# ------------------------------------------------------------------------------
+outputs:
+  log_file: results/e2_boyatcn_train.log
+  csv_file: results/e2_boyatcn_train_log.csv
+  window_stats_csv: results/e2_window_stats.csv
+  vocab_stats_json: results/e2_vocab_stats.json
+  window_test_json: results/e2_window_slice_test.json
