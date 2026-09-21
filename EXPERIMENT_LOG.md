@@ -1,7 +1,7 @@
 # 南音生成实验日志
 
-> 分支：主线 `exp3_window_inference` → 当前 `feature/compound-events`
-> 实验线：E0 基线 → exp1（其它分支）→ exp2（训练切片）→ exp3（窗口推理 + 评估 + 可视化）→ E1（复合事件编解码）
+> 分支：主线 `exp3_window_inference` → E1 `feature/compound-events` → 当前 `feature/E2_compound_window`
+> 实验线：E0 基线 → exp1（其它分支）→ exp2（训练切片）→ exp3（窗口推理 + 评估 + 可视化）→ E1（复合事件编解码）→ E2（滑窗样本 + 窗口训练）
 
 ---
 
@@ -269,6 +269,87 @@ file-level 比较必须两侧同键 `(start, note)` 排序；
 
 ---
 
+## E2 — 复合事件滑窗样本 + BoYaTCN 窗口训练（`feature/E2_compound_window`）
+
+提交链：`c6cbc72`（配置）→ `21d6327`（数据）→ `3530286`（模型）→ `fca09ec`（自测）→ `90a84f4`（训练）→ `（本报告与日志补记）`
+详细报告：`reports/E2_window_training.md`
+
+### E2.0 目标与范围
+
+在 E1 编解码基础上做**滑窗样本构建 + BoYaTCN 窗口训练**；损失只有
+`total = 1.0*pitch_CE + 0.7*duration_CE + 0.7*shift_CE`，
+**不做 L0-L5 损失消融**（留给 E3）、不生成 MIDI、不做评估。
+
+### E2.1 各文件改动明细
+
+**新增 `configs/e2_compound_window.yaml` + 修改 `nanyin_config.py`（配置分层）**
+
+- E2 yaml 是**覆盖层**：`load_config(path)` 先读基础层 `e1_compound_events.yaml` 再做深合并，
+  未声明字段回退基础层 → codec/model 等跨阶段参数只有一份真源，避免双份维护漂移；
+- 新增 `window:`（256 事件窗口 / 训练步长 128 / 验证步长 256 / drop_tail）、
+  `training:`（200 轮上限、bs16、lr1e-3、wd1e-5、grad_clip1.0、early_stop_patience20、
+  损失权重 1.0/0.7/0.7、词表日志每 10 轮）、`outputs:`（产物路径）三节；
+- 基础层 codec 新增 `num_special_tokens: 2`（BOS/EOS）。
+
+**修改 `dataset_nanyin.py`（窗口切分核心）**
+
+- 新增 `encode_song_events()`（整曲→三路 ID 序列）、`slice_event_windows()`（等长窗口、不足丢弃）、
+  `build_window_sample()`（BOS/EOS/attention_mask/掩码）、
+  `CompoundEventWindowDataset`、`get_compound_window_datasets()`、`collate_compound_batch()`、
+  `compute_vocab_class_stats()`（duration/shift 词表类别频次与长尾统计）；
+- 布局：输入 `[BOS] + 256 事件`，目标 `256 事件 + [EOS]`，长度 257；
+  **目标末两位（最后事件位 + EOS 位）shift 置 `IGNORE_INDEX=-100`**，
+  且输入侧窗口末 shift 也置 0（未定义），保证"伪标签不参与反向传播"；
+- 曲目 ID 隔离：训练 9 首 / 验证 2 首无交集，窗口只在单曲内切；
+- 四条 E1 硬性约束落地：① 末尾 shift ignore_index 掩码；② 词表长尾频次统计；
+  ③ 被 `max_notes=4096` 截断的曲目清单如实打印；④ **GT 噪声来源写入文件头注释**
+  （GT=BasicPitch 转录，同音重叠，写回 MIDI 时前一音时值被截断 → 局部时值噪声，论文须记录）。
+
+**修改 `models.py`（词表扩展 BOS/EOS）**
+
+- 三路 embedding / 分类头大小 = 真实类别数 + `num_special_tokens`：
+  pitch 130、duration 404、shift 1004；BoYaTCN 与 MusicMamba 口径统一。
+
+**修改 `train_boyatcn.py`（新增 E2 训练模式）**
+
+- 新增 `--mode {noef, compound}`，**原 E0/exp 主线 NOEF 整曲训练路径（`train()`）完全保留**；
+- `train_compound()`：三路加权 CE（shift 用 ignore_index）、Adam+StepLR、梯度裁剪、
+  **早停监控验证集 total loss（patience 20）**、保存 `best_valloss_model.pt`（best-val）；
+- 训练前必打：窗口统计清单（写 CSV）、max_notes 截断曲目清单、词表长尾统计（写 JSON）；
+  训练中每 10 轮复打长尾摘要；逐轮 train/val 分项 loss + val token 准确率写入日志与 CSV。
+
+**新增 `tests/test_window_slice.py`（窗口切分单元自测）**
+
+- T1 窗口数量公式与边界（7 个子用例）、T2 无 padding、T3 曲目 ID 隔离、
+  T4 BOS/EOS/attention_mask、T5 伪标签掩码（位置 + 损失等价 + 梯度为 0 三层验证）、
+  T6 切片一致性与 onset 单调、T7 真实数据统计；实测 **22/22 PASS**。
+
+### E2.2 实测结果（真实运行，非挑选）
+
+| 项 | 实测 |
+|---|---|
+| 窗口数 | 训练 248（9 首，步长 128）/ 验证 10（2 首，非重叠）；尾部丢弃 358 事件 |
+| 被 max_notes 截断 | 6 首（dapu02/04/05/06/12/13，合计丢弃 7282 音符，均未参与训练）|
+| 单元自测 | 22/22 PASS；掩码三层验证：损失等价差 0.00e+00，不屏蔽时 7.4636 vs 7.4647，屏蔽位梯度 0.0e+00 |
+| 训练 | 200 轮上限，**早停于 epoch 27**（val 连续 20 轮未下降），耗时 4.6 分钟，cuda |
+| best-val | **epoch 7，val_total = 6.8788**（`checkpoints/e2_boyatcn/best_valloss_model.pt`）|
+| best 轮验证 token 准确率 | pitch 36.07% / duration 7.00% / shift 23.22% |
+| 末轮（27）| train 1.8382 vs val 10.1936；准确率 34.67% / 5.84% / 11.14% |
+| 词表长尾 | duration 185/404 类出现（219 类零样本，长尾 62 类占 0.25%）；shift 175/1004 类出现（**829 类零样本**，长尾 46 类占 0.17%）|
+
+**不如预期的地方（如实记录，详见报告第 7 节）**：
+
+1. **严重过拟合**：train loss 9.34→1.84 单调下降，val loss 却在第 5~7 轮见底（6.88）后升到 10.19；
+   248 窗口 / 9 首喂 3.44M 参数，best-val 落在 epoch 7。
+2. **duration 头几乎没学到**：验证准确率 epoch1 7.12% → best 7.00% → 末轮 5.84%，
+   低于多数类基线（≈10.8%），404 类细档 + 分布集中是主因。
+3. **shift 验证准确率随训练下降**（24.98% → 23.22% → 11.14%），与过拟合一致。
+4. **验证集过小**：仅 2 首 10 窗口，val loss 抖动大、早停判定敏感。
+5. **伪标签掩码的代价**：中段窗口最后 1 个真实可得的 shift 监督被一并屏蔽（248 个/轮），
+   选择一致处理是为与"第 256 事件后接 EOS"的生成语义一致；E3 若要回收需区分整曲末尾/中段窗口。
+
+---
+
 ## 4. 分支与提交历史
 
 主线：`exp3_window_inference`（exp1 消融实验在其它分支）；E1 起新分支 `feature/compound-events`（自 main `006ac88` 切出）。
@@ -279,7 +360,9 @@ file-level 比较必须两侧同键 `(start, note)` 排序；
 | `5acabba` | exp3_window_inference | exp2：仅改 `dataset_nanyin.py`，256 音符窗口切片，其余不动（控制变量）|
 | `ffff985` | exp3_window_inference | exp3：窗口粒度推理 + Tier-1 评估 + UMAP/t-SNE 可视化 |
 | `dde7a3a` | exp3_window_inference | 本日志补充分支历史与资产台账 |
-| `ee8d23e` | feature/compound-events | E1：复合事件（pitch+duration+time-shift）编解码 + 三路分类头 + MIDI 绝对时间写出 + 往返自测（当前 HEAD）|
+| `ee8d23e` | feature/compound-events | E1：复合事件（pitch+duration+time-shift）编解码 + 三路分类头 + MIDI 绝对时间写出 + 往返自测 |
+| `ecf8293` | feature/compound-events | 日志补记 E1 阶段（逐文件改动明细 + 自测结果 + 资产台账）|
+| `c6cbc72` → `90a84f4` | feature/E2_compound_window | E2：滑窗与训练配置、256 事件窗口切分（BOS/EOS+掩码+GT 噪声注释）、词表扩展 BOS/EOS、窗口切分自测、三输出头窗口训练（当前 HEAD）|
 
 > 线路调整记录：2026-09-17 曾做过一版"以 10 窗口指标 CSV 为数据源的作图"及对应脚本改动
 > （提交 `8109fd0` / `d23efb5`），经确认口径有歧义后整体废弃，分支硬回退到 `5acabba` 并清理全部
@@ -318,6 +401,14 @@ file-level 比较必须两侧同键 `(start, note)` 排序；
 | `reports/E1_selftest_compound_events.md` | E1 自测报告（入库）：配置、结论表、单元/曲目/边界用例明细、已知局限 7 条、复现方式 |
 | `tests/`（含 `.gitignore` 规则 `tests/*` + `!tests/*.py`）| 自测脚本目录，只入库 `.py` |
 
+### 5.1c E2 配置与报告（`configs/`、`reports/`、`tests/`，✅ 入库）
+
+| 文件 | 说明 |
+|---|---|
+| `configs/e2_compound_window.yaml` | E2 **覆盖层**配置：未声明字段回退 E1 基础层。`window:`（256 事件窗口 / 训练步长 128 / 验证步长 256 / drop_tail）、`training:`（200 轮上限、bs16、lr1e-3、wd1e-5、clip1.0、patience20、权重 1.0/0.7/0.7、词表日志每 10 轮）、`outputs:`（产物路径）|
+| `reports/E2_window_training.md` | E2 训练报告（入库）：窗口统计清单、超参、27 轮完整 loss 表与早停节点、词表长尾统计、7 条已知问题（含过拟合与 duration 头未学到东西）、复现方式 |
+| `tests/test_window_slice.py` | E2 新增：窗口切分与掩码自测 T1-T7（22 项），产出自测明细 JSON |
+
 ### 5.2 权重与工具（`checkpoints/`，🏠 不入库）
 
 | 路径 | 说明 |
@@ -347,6 +438,17 @@ file-level 比较必须两侧同键 `(start, note)` 排序；
 |---|---|
 | `e1_roundtrip_metrics.json` | E1 自测指标：unit_checks + 11 首逐曲误差统计（pitch/duration/onset 均值与 max、容差内比例、写回重读计数）+ 5 个边界用例明细 |
 | `e1_roundtrip_tmp/*.mid` | E1 往返临时 MIDI（11 首 GT 往返 + 边界用例 + 重复对照，可随时由自测脚本重建）|
+
+### 5.3c E2 产物（`results/`，🏠 不入库）
+
+| 路径 | 说明 |
+|---|---|
+| `e2_window_stats.csv` | 窗口数量统计清单：逐曲 划分/事件数/窗口数/尾部丢弃事件/max_notes 截断音符 |
+| `e2_boyatcn_train.log` | 完整训练日志：配置、窗口统计、截断清单、词表频次统计、27 轮逐轮 loss 与早停节点 |
+| `e2_boyatcn_train_log.csv` | 逐轮 train/val 分项 loss + val token 准确率 + lr + is_best（27 行）|
+| `e2_vocab_stats.json` | duration / time-shift 词表各类别频次、零样本类别数、长尾类别与占比、Top10 类别 |
+| `e2_window_slice_test.json` | 窗口切分自测明细（22 项判定 + 各用例实测值）|
+| `checkpoints/e2_boyatcn/best_valloss_model.pt` | E2 best-val 权重（epoch 7，val_total 6.8788）|
 
 ### 5.4 E0 / 历史产物（`results/`，🏠 不入库，保留作对照）
 
