@@ -3,6 +3,16 @@
 train_boyatcn.py - 南音BoYaTCN模型训练脚本
 ============================================
 
+运行模式（--mode）：
+  * ``noef``（默认旧路径，E0/exp 主线）：整曲 + NOEF 复合损失，见 train()；
+  * ``compound``（E2 新增）：复合事件窗口训练，见 train_compound()。
+      venv/Scripts/python.exe train_boyatcn.py --mode compound
+    - 样本：256 事件窗口（训练集步长 128 滑动 / 验证集非重叠），
+      窗口自带 BOS/EOS、attention_mask，末尾 time-shift 伪标签用 ignore_index 屏蔽；
+    - 损失：total = 1.0*pitch_CE + 0.7*duration_CE + 0.7*shift_CE（**无 L0-L5 消融**）；
+    - 早停：监控验证集 total loss，保存 best-val checkpoint；
+    - 必打日志：窗口数量清单、max_notes 截断曲目清单、duration/shift 词表长尾频次统计。
+
 功能概述：
   1. 对接 dataset_nanyin.py（数据集）与 loss_nanyin.py（复合损失），
      加载固定划分的训练集（15首）与验证集（3首）；
@@ -30,9 +40,13 @@ train_boyatcn.py - 南音BoYaTCN模型训练脚本
 import os
 import sys
 import csv
+import json
 import math
-from typing import Dict, List, Optional, Tuple
+import random
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -53,10 +67,16 @@ from loss_nanyin import (
     NANYIN_FOUR_MODES,
 )
 from dataset_nanyin import (
+    IGNORE_INDEX,
     get_train_dataset,
     get_val_dataset,
     collate_nanyin_batch,
+    collate_compound_batch,
+    compute_vocab_class_stats,
+    get_compound_codec,
+    get_compound_window_datasets,
 )
+from nanyin_config import load_config, E2_CONFIG_PATH
 from nanyin_metrics import NOEF_CATEGORY_WEIGHTS
 
 
@@ -820,8 +840,413 @@ def train(finals: Optional[Tuple[float, float, float, float, float]] = None,
 
 
 # ==============================================================================
-# 七、脚本入口
+# 七、E2：复合事件窗口训练（三输出头）
+# ==============================================================================
+#
+# 与上方 NOEF 老路径完全隔离：老路径（train()）保持不动，E2 走 train_compound()。
+# 损失口径（E2 当前阶段**不做 L0-L5 消融**，消融留给 E3）：
+#     total_loss = 1.0 * pitch_CE + 0.7 * duration_CE + 0.7 * shift_CE
+# shift_CE 使用 ignore_index=IGNORE_INDEX，屏蔽窗口最后一个事件位（伪标签）与 EOS 位。
+# ==============================================================================
+
+
+def set_seed(seed: int) -> None:
+    """设置 E2 训练所需的全部随机种子（与老路径无关，E2 独立控制）。"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def compute_compound_loss(
+    pred: Dict[str, torch.Tensor],
+    tgt: Dict[str, torch.Tensor],
+    w_pitch: float,
+    w_duration: float,
+    w_shift: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """E2 三路分类 CE。
+
+        total = w_pitch * pitch_CE + w_duration * duration_CE + w_shift * shift_CE
+
+    shift_CE 使用 ignore_index=IGNORE_INDEX：窗口最后一个事件位（伪标签）与 EOS 位
+    不参与损失，也不参与反向传播。
+    """
+    pitch_ce = F.cross_entropy(
+        pred["pred_pitch_logits"].reshape(-1, pred["pred_pitch_logits"].shape[-1]),
+        tgt["target_pitch_ids"].reshape(-1),
+    )
+    duration_ce = F.cross_entropy(
+        pred["pred_duration_logits"].reshape(-1, pred["pred_duration_logits"].shape[-1]),
+        tgt["target_duration_ids"].reshape(-1),
+    )
+    shift_ce = F.cross_entropy(
+        pred["pred_shift_logits"].reshape(-1, pred["pred_shift_logits"].shape[-1]),
+        tgt["target_shift_ids"].reshape(-1),
+        ignore_index=IGNORE_INDEX,
+    )
+    total = w_pitch * pitch_ce + w_duration * duration_ce + w_shift * shift_ce
+    return total, {
+        "pitch_ce": float(pitch_ce.detach()),
+        "duration_ce": float(duration_ce.detach()),
+        "shift_ce": float(shift_ce.detach()),
+        "total": float(total.detach()),
+    }
+
+
+@torch.no_grad()
+def evaluate_compound(
+    model: NanyinBoYaTCN,
+    val_loader: DataLoader,
+    device: torch.device,
+    w_pitch: float,
+    w_duration: float,
+    w_shift: float,
+) -> Dict[str, float]:
+    """验证集评估：加权 total loss + 三路分项 CE + token 级准确率。"""
+    model.eval()
+    acc = {"pitch_ce": 0.0, "duration_ce": 0.0, "shift_ce": 0.0, "total": 0.0}
+    correct = {"pitch": 0, "duration": 0, "shift": 0}
+    n_tok = {"pitch": 0, "duration": 0, "shift": 0}
+    num_batches = 0
+
+    for batch in val_loader:
+        tgt = {
+            "target_pitch_ids": batch["target_pitch_ids"].to(device),
+            "target_duration_ids": batch["target_duration_ids"].to(device),
+            "target_shift_ids": batch["target_shift_ids"].to(device),
+        }
+        pred = model(
+            batch["input_pitch_ids"].to(device),
+            batch["input_duration_ids"].to(device),
+            batch["input_shift_ids"].to(device),
+        )
+        _, info = compute_compound_loss(pred, tgt, w_pitch, w_duration, w_shift)
+        for k in acc:
+            acc[k] += info[k]
+        num_batches += 1
+
+        correct["pitch"] += int((pred["pred_pitch_logits"].argmax(-1) == tgt["target_pitch_ids"]).sum())
+        correct["duration"] += int((pred["pred_duration_logits"].argmax(-1) == tgt["target_duration_ids"]).sum())
+        valid = tgt["target_shift_ids"] != IGNORE_INDEX
+        correct["shift"] += int((pred["pred_shift_logits"].argmax(-1)[valid] == tgt["target_shift_ids"][valid]).sum())
+        n_tok["pitch"] += int(tgt["target_pitch_ids"].numel())
+        n_tok["duration"] += int(tgt["target_duration_ids"].numel())
+        n_tok["shift"] += int(valid.sum())
+
+    n = max(num_batches, 1)
+    out = {k: v / n for k, v in acc.items()}
+    for k in ("pitch", "duration", "shift"):
+        out[f"{k}_acc"] = correct[k] / n_tok[k] if n_tok[k] else 0.0
+    return out
+
+
+def _e2_log(log_lines: List[str], msg: str, fh=None) -> None:
+    """打印到 stdout 并同步写入 E2 日志文件。"""
+    print(msg)
+    if fh is not None:
+        fh.write(msg + "\n")
+        fh.flush()
+    log_lines.append(msg)
+
+
+def _log_vocab_stats(stats: Dict[str, Any], log_lines: List[str], fh=None,
+                     top_k: int = 10, compact: bool = False) -> None:
+    """打印 duration / time-shift 词表类别频次统计（长尾监控）。"""
+    _e2_log(log_lines, f"  [词表统计] 窗口数={stats['num_windows']}, 事件数={stats['num_events']}", fh)
+    for name in ("duration", "shift"):
+        s = stats[name]
+        _e2_log(log_lines,
+                f"    - {name:<9} 类别总数={s['num_classes']}, 实际出现={s['used_classes']}, "
+                f"零样本类别={s['zero_count_classes']}, 样本token数={s['total_tokens']}", fh)
+        _e2_log(log_lines,
+                f"      长尾（频次<={s['long_tail_threshold']}）类别={s['long_tail_classes']}, "
+                f"占样本比例={s['long_tail_token_share'] * 100:.2f}%", fh)
+        if not compact:
+            top = ", ".join(f"{c['class_id']}:{c['count']}" for c in s["top_classes"])
+            _e2_log(log_lines, f"      频次 Top{top_k}: {top}", fh)
+
+
+def train_compound(
+    num_epochs: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    learning_rate: Optional[float] = None,
+    seed: Optional[int] = None,
+    checkpoint_dir: Optional[str] = None,
+    patience: Optional[int] = None,
+) -> Dict[str, Any]:
+    """E2：复合事件窗口训练主流程（加权三路 CE + 早停 best-val）。"""
+    cfg = load_config(E2_CONFIG_PATH)
+    tcfg = cfg["training"]
+    outcfg = cfg["outputs"]
+
+    num_epochs = int(num_epochs if num_epochs is not None else tcfg["num_epochs"])
+    batch_size = int(batch_size if batch_size is not None else tcfg["batch_size"])
+    learning_rate = float(learning_rate if learning_rate is not None else tcfg["learning_rate"])
+    seed = int(seed if seed is not None else cfg["experiment"]["seed"])
+    patience = int(patience if patience is not None else tcfg["early_stop_patience"])
+    checkpoint_dir = checkpoint_dir if checkpoint_dir is not None else tcfg["checkpoint_dir"]
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    w_pitch = float(tcfg["loss_weight_pitch"])
+    w_duration = float(tcfg["loss_weight_duration"])
+    w_shift = float(tcfg["loss_weight_shift"])
+    vocab_every = int(tcfg["vocab_log_every_epochs"])
+    top_k = int(tcfg["top_k_classes"])
+
+    set_seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    log_path = outcfg["log_file"]
+    csv_path = outcfg["csv_file"]
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    log_lines: List[str] = []
+    fh = open(log_path, "w", encoding="utf-8")
+
+    _e2_log(log_lines, "=" * 74, fh)
+    _e2_log(log_lines, f"E2 复合事件窗口训练 — BoYaTCN（分支 {cfg['experiment']['branch']}）", fh)
+    _e2_log(log_lines, "=" * 74, fh)
+    _e2_log(log_lines, f"设备={device}, seed={seed}, epochs={num_epochs}, batch_size={batch_size}, "
+                       f"lr={learning_rate}, weight_decay={tcfg['weight_decay']}, "
+                       f"early_stop_patience={patience}", fh)
+    _e2_log(log_lines, f"损失: total = {w_pitch}*pitch_CE + {w_duration}*duration_CE + {w_shift}*shift_CE"
+                       f"（shift 使用 ignore_index={IGNORE_INDEX} 屏蔽窗口尾伪标签）", fh)
+    _e2_log(log_lines, "本阶段不做 L0-L5 损失消融（留给 E3）：无音级 / 调式 / IOI 额外损失。", fh)
+
+    # ---------------- 数据 ----------------
+    codec = get_compound_codec(cfg)
+    _e2_log(log_lines, f"\n[编解码] time_unit={codec.time_unit_sec}s, 词表 "
+                       f"pitch={codec.pitch_vocab_total}/duration={codec.duration_vocab_total}"
+                       f"/shift={codec.shift_vocab_total}（含BOS/EOS）, max_notes={codec.max_notes}", fh)
+
+    train_ds, val_ds = get_compound_window_datasets(cfg=cfg, verbose=False)
+
+    _e2_log(log_lines, "\n[窗口统计] 训练集（滑动，步长128） + 验证集（非重叠，步长256）", fh)
+    _e2_log(log_lines, f"  {'曲目':<28}{'划分':<7}{'事件数':>8}{'窗口数':>8}{'尾丢弃':>8}{'max_notes截断':>14}", fh)
+    rows = train_ds.song_stats_rows() + val_ds.song_stats_rows()
+    for r in rows:
+        _e2_log(log_lines, f"  {r['song_id']:<28}{r['split']:<7}{r['num_events']:>8}"
+                           f"{r['num_windows']:>8}{r['discarded_tail_events']:>8}"
+                           f"{r['truncated_notes']:>14}", fh)
+    _e2_log(log_lines, f"  训练集窗口数={len(train_ds)}, 验证集窗口数={len(val_ds)}", fh)
+
+    # ---- 硬性要求：如实打印被 max_notes 截断的曲目清单 ----
+    truncated = train_ds.truncated_songs() + val_ds.truncated_songs()
+    _e2_log(log_lines, f"\n[截断清单] 被 max_notes={codec.max_notes} 截断的曲目（共 {len(truncated)} 首）：", fh)
+    if truncated:
+        for r in truncated:
+            _e2_log(log_lines, f"  - {r['song_id']} [{r['split']}]：丢弃 {r['truncated_notes']} 个音符"
+                               f"（保留 {r['num_events']}）", fh)
+    else:
+        _e2_log(log_lines, "  （无）", fh)
+
+    with open(outcfg["window_stats_csv"], "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    _e2_log(log_lines, f"  窗口统计清单已写入: {outcfg['window_stats_csv']}", fh)
+
+    # ---- 硬性要求：词表类别频次统计（长尾监控）----
+    _e2_log(log_lines, "\n[词表类别频次统计] 训练集监督位置（shift 跳过伪标签位）：", fh)
+    vocab_stats = compute_vocab_class_stats(
+        train_ds, top_k=top_k, long_tail_threshold=int(tcfg["long_tail_threshold"])
+    )
+    _log_vocab_stats(vocab_stats, log_lines, fh, top_k=top_k)
+    with open(outcfg["vocab_stats_json"], "w", encoding="utf-8") as f:
+        json.dump(vocab_stats, f, ensure_ascii=False, indent=2)
+    _e2_log(log_lines, f"  词表统计明细已写入: {outcfg['vocab_stats_json']}", fh)
+
+    g = torch.Generator()
+    g.manual_seed(seed)
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=bool(tcfg["shuffle"]),
+        collate_fn=collate_compound_batch, generator=g,
+        num_workers=int(tcfg["num_workers"]),
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        collate_fn=collate_compound_batch, num_workers=int(tcfg["num_workers"]),
+    )
+
+    # ---------------- 模型 ----------------
+    model = NanyinBoYaTCN().to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=learning_rate, weight_decay=float(tcfg["weight_decay"])
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=int(tcfg["lr_step_size"]), gamma=float(tcfg["lr_gamma"])
+    )
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    _e2_log(log_lines, f"\n[模型] NanyinBoYaTCN 可训练参数 {n_params:,}", fh)
+
+    # ---------------- 训练循环 ----------------
+    history: List[Dict[str, Any]] = []
+    best_val = float("inf")
+    best_epoch = -1
+    no_improve = 0
+    best_path = os.path.join(checkpoint_dir, tcfg["best_ckpt_name"])
+    periodic_every = int(tcfg.get("periodic_ckpt_every", 0))
+    start_time = time.time()
+
+    _e2_log(log_lines, "\n[训练开始]", fh)
+    _e2_log(log_lines, f"{'epoch':>6}{'train_total':>13}{'pitch':>10}{'dur':>10}{'shift':>10}"
+                       f"{'val_total':>12}{'val_p':>9}{'val_d':>9}{'val_s':>9}{'lr':>10}{'备注':>8}", fh)
+
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        run = {"pitch_ce": 0.0, "duration_ce": 0.0, "shift_ce": 0.0, "total": 0.0}
+        n_batches = 0
+        for batch in train_loader:
+            tgt = {
+                "target_pitch_ids": batch["target_pitch_ids"].to(device),
+                "target_duration_ids": batch["target_duration_ids"].to(device),
+                "target_shift_ids": batch["target_shift_ids"].to(device),
+            }
+            pred = model(
+                batch["input_pitch_ids"].to(device),
+                batch["input_duration_ids"].to(device),
+                batch["input_shift_ids"].to(device),
+            )
+            loss, info = compute_compound_loss(pred, tgt, w_pitch, w_duration, w_shift)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(tcfg["grad_clip"]))
+            optimizer.step()
+            for k in run:
+                run[k] += info[k]
+            n_batches += 1
+
+        n_batches = max(n_batches, 1)
+        train_avg = {k: v / n_batches for k, v in run.items()}
+        val = evaluate_compound(model, val_loader, device, w_pitch, w_duration, w_shift)
+        lr_now = optimizer.param_groups[0]["lr"]
+
+        note = ""
+        is_best = val["total"] < best_val
+        if is_best:
+            best_val = val["total"]
+            best_epoch = epoch
+            no_improve = 0
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": best_val,
+                "train_loss": train_avg["total"],
+                "config": cfg,
+            }, best_path)
+            note = "★best"
+        else:
+            no_improve += 1
+
+        _e2_log(log_lines,
+                f"{epoch:>6}{train_avg['total']:>13.4f}{train_avg['pitch_ce']:>10.4f}"
+                f"{train_avg['duration_ce']:>10.4f}{train_avg['shift_ce']:>10.4f}"
+                f"{val['total']:>12.4f}{val['pitch_ce']:>9.4f}{val['duration_ce']:>9.4f}"
+                f"{val['shift_ce']:>9.4f}{lr_now:>10.2e}{note:>8}", fh)
+
+        history.append({
+            "epoch": epoch,
+            "train_total": train_avg["total"],
+            "train_pitch_ce": train_avg["pitch_ce"],
+            "train_duration_ce": train_avg["duration_ce"],
+            "train_shift_ce": train_avg["shift_ce"],
+            "val_total": val["total"],
+            "val_pitch_ce": val["pitch_ce"],
+            "val_duration_ce": val["duration_ce"],
+            "val_shift_ce": val["shift_ce"],
+            "val_pitch_acc": val["pitch_acc"],
+            "val_duration_acc": val["duration_acc"],
+            "val_shift_acc": val["shift_acc"],
+            "lr": lr_now,
+            "is_best": is_best,
+        })
+
+        if periodic_every > 0 and (epoch % periodic_every == 0):
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val["total"],
+            }, os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt"))
+
+        if vocab_every > 0 and (epoch % vocab_every == 0):
+            _e2_log(log_lines, f"  [词表长尾摘要 @epoch {epoch}]", fh)
+            _log_vocab_stats(vocab_stats, log_lines, fh, top_k=top_k, compact=True)
+
+        scheduler.step()
+
+        if no_improve >= patience:
+            _e2_log(log_lines, f"\n[早停] 验证集 total loss 连续 {patience} 轮未下降，"
+                               f"于 epoch {epoch} 终止训练。", fh)
+            break
+
+    elapsed = time.time() - start_time
+    _e2_log(log_lines, "\n[训练结束]", fh)
+    _e2_log(log_lines, f"  总轮数={len(history)}, 耗时={elapsed / 60:.1f} 分钟", fh)
+    _e2_log(log_lines, f"  最优验证 total loss={best_val:.4f} @ epoch {best_epoch}"
+                       f"（best-val checkpoint: {best_path}）", fh)
+    best_row = next((h for h in history if h["epoch"] == best_epoch), None)
+    if best_row:
+        _e2_log(log_lines, f"  该轮验证 token 准确率: pitch={best_row['val_pitch_acc'] * 100:.2f}%, "
+                           f"duration={best_row['val_duration_acc'] * 100:.2f}%, "
+                           f"shift={best_row['val_shift_acc'] * 100:.2f}%", fh)
+
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+        writer.writeheader()
+        writer.writerows(history)
+    _e2_log(log_lines, f"  逐轮日志 CSV: {csv_path}", fh)
+    _e2_log(log_lines, f"  完整训练日志: {log_path}", fh)
+    fh.close()
+
+    return {
+        "history": history,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val,
+        "best_ckpt": best_path,
+        "num_train_windows": len(train_ds),
+        "num_val_windows": len(val_ds),
+        "elapsed_sec": elapsed,
+        "vocab_stats": vocab_stats,
+        "num_params": n_params,
+    }
+
+
+# ==============================================================================
+# 八、脚本入口
 # ==============================================================================
 
 if __name__ == "__main__":
-    train()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="BoYaTCN 训练脚本")
+    parser.add_argument("--mode", type=str, default="noef", choices=["noef", "compound"],
+                        help="noef=E0/exp 主线整曲训练（默认）；compound=E2 复合事件窗口训练")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--patience", type=int, default=None)
+    parser.add_argument("--checkpoint-dir", type=str, default=None)
+    args = parser.parse_args()
+
+    if hasattr(sys.stdout, "reconfigure"):           # type: ignore[attr-defined]
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+
+    if args.mode == "compound":
+        result = train_compound(
+            num_epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            seed=args.seed,
+            checkpoint_dir=args.checkpoint_dir,
+            patience=args.patience,
+        )
+        print(f"\n完成：最优验证 total loss={result['best_val_loss']:.4f} "
+              f"@ epoch {result['best_epoch']}；checkpoint: {result['best_ckpt']}")
+    else:
+        train()
