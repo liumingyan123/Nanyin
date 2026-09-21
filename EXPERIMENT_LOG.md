@@ -406,7 +406,9 @@ file-level 比较必须两侧同键 `(start, note)` 排序；
 | 文件 | 说明 |
 |---|---|
 | `configs/e2_compound_window.yaml` | E2 **覆盖层**配置：未声明字段回退 E1 基础层。`window:`（256 事件窗口 / 训练步长 128 / 验证步长 256 / drop_tail）、`training:`（200 轮上限、bs16、lr1e-3、wd1e-5、clip1.0、patience20、权重 1.0/0.7/0.7、词表日志每 10 轮）、`outputs:`（产物路径）|
-| `reports/E2_window_training.md` | E2 训练报告（入库）：窗口统计清单、超参、27 轮完整 loss 表与早停节点、词表长尾统计、7 条已知问题（含过拟合与 duration 头未学到东西）、复现方式 |
+| `reports/E2_window_training.md` | E2 训练报告（入库）：窗口统计清单、超参、27 轮完整 loss 表与早停节点、词表长尾统计、7 条已知问题（含过拟合与 duration 头未学到东西）、损失曲线图、复现方式 |
+| `reports/E2_loss_curve.png` | E2 损失曲线图（入库）：左=train/val 总损失+best-val 标注（epoch 7 见底后回升），右=三路分项 CE（train 实线/val 虚线，duration 的 val CE 不降反升）|
+| `plot_loss_curve.py` | E2 新增作图脚本：读逐轮损失 CSV → 双面板损失曲线 PNG（中文字体处理与 visualize_embedding.py 一致）|
 | `tests/test_window_slice.py` | E2 新增：窗口切分与掩码自测 T1-T7（22 项），产出自测明细 JSON |
 
 ### 5.2 权重与工具（`checkpoints/`，🏠 不入库）

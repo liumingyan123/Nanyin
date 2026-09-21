@@ -162,4 +162,13 @@ venv/Scripts/python.exe train_boyatcn.py --mode compound
 产物路径：`results/e2_window_stats.csv`（窗口清单）、`results/e2_boyatcn_train.log`（完整日志）、
 `results/e2_boyatcn_train_log.csv`（逐轮 CSV）、`results/e2_vocab_stats.json`（词表统计）、
 `results/e2_window_slice_test.json`（自测明细）、`checkpoints/e2_boyatcn/best_valloss_model.pt`（best-val 权重）。
-（均被 .gitignore 排除，不入库；本报告与代码入库。）
+（均被 .gitignore 排除，不入库；本报告、损失曲线图与代码入库。）
+
+## 9. 损失曲线图
+
+![E2 损失曲线](E2_loss_curve.png)
+
+（`reports/E2_loss_curve.png`，由 `plot_loss_curve.py` 从 `results/e2_boyatcn_train_log.csv` 绘制。
+左：train/val 总损失与 best-val 轮次；右：三路分项 CE，train 实线 / val 虚线。
+图上可见：train 单调下降至 1.84，val 在 epoch 7 见底（6.8788）后回升至 10.19；
+duration 的 val CE 全程高于其 train 对应值且不降反升，与第 7 节"duration 头几乎没学到"一致。）
