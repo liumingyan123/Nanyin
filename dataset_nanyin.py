@@ -32,6 +32,18 @@ dataset_nanyin.py - 南音数据集自定义PyTorch Dataset工具
 
     sample_tokens, target_dict = train_ds[0]
     # target_dict 可直接传入 loss_nanyin.nanyin_total_loss()
+
+⚠ GT 数据噪声来源（E2 硬性要求，论文实验必须记录，勿删除本段）：
+  训练/评估用的 GT = **BasicPitch 对南音 dapu 大谱音频的自动转录**
+  （output/BasicPitch/*.mid），不是人工校对的谱面，存在**同音重叠音符**：
+  转录会对同一音高产出相互重叠（或首尾相接）的多个音符。本数据集在编码阶段
+  按 (start_time, pitch) 排序后逐音编码，时值保留转录原值；但在**写回 MIDI**
+  时（generate_music.notes_to_midi）为保证音符数量不丢（规避 (channel, pitch)
+  配对歧义导致丢音，历史 bug：1025 音符被解析成 792），会把**前一个音的时值截断
+  到后一个音的起点**。
+  ⇒ 该截断会**引入局部时值噪声**：这些音符的时值被人为缩短，且模型学到的时值
+    分布会继承这部分偏差。论文实验须明确记录该噪声来源及其量级（见
+    reports/E1_selftest_compound_events.md 与 reports/E2_window_training.md）。
 """
 
 import os
@@ -48,7 +60,7 @@ try:
 except ImportError:
     pretty_midi = None
 
-from nanyin_config import load_config, get_section
+from nanyin_config import load_config, get_section, E2_CONFIG_PATH
 
 
 # ==============================================================================
@@ -210,6 +222,9 @@ def load_song_annotations(song_id: str, base_dir: str = _DATASET_BASE) -> Option
     if not notes:
         print(f"[dataset_nanyin] BasicPitch midi 无音符 [{song_id}]: {mid_path}")
         return None
+    # 排序键：(start_time, pitch)。同音重叠音符（BasicPitch 转录噪声）在此被相邻排列，
+    # 编码阶段保留转录原时值；写回 MIDI 时前一音会被截断到后一音起点（噪声来源，
+    # 见文件头"GT 数据噪声来源"注释，论文实验必须记录）。
     notes.sort(key=lambda x: (x["start_time"], x["note"]))
 
     midi_data = {
@@ -271,6 +286,15 @@ class CompoundEventCodec:
          为 20.00 s 下界，无法表达确切休止长度；音符时值同理（>= 8.00 s 溢出）。
          ⇒ 一旦发生溢出，其后所有音符的 onset 会被永久性地向前平移（误差累积），
             具体误差分布见 reports/E1_selftest_compound_events.md。
+
+    特殊 token（E2 起，用于窗口样本的 BOS / EOS 标记）：
+        每路词表在真实类别之上追加 ``num_special_tokens``（当前 2）个 id：
+            pitch    : BOS = pitch_vocab_size(128),      EOS = 129
+            duration : BOS = duration_num_classes(402),  EOS = 403
+            shift    : BOS = shift_num_classes(1002),    EOS = 1003
+        三路词表**总大小** = 真实类别数 + 2（模型 embedding / 分类头必须使用总大小）。
+        BOS / EOS 只是序列边界标记，不携带音高/时值语义；窗口样本中它们的位置
+        由 ``build_window_sample()`` 给出。
     """
 
     def __init__(self, cfg: Optional[dict] = None):
@@ -282,10 +306,25 @@ class CompoundEventCodec:
         self.duration_max_steps: int = int(codec_cfg["duration_max_steps"])
         self.shift_max_steps: int = int(codec_cfg["shift_max_steps"])
         self.max_notes: int = int(codec_cfg["max_notes"])
+        self.num_special_tokens: int = int(codec_cfg.get("num_special_tokens", 0))
 
         # 0 号保留给 PAD / 未定义，末档为溢出档
         self.duration_num_classes: int = self.duration_max_steps + 2
         self.shift_num_classes: int = self.shift_max_steps + 2
+
+        # ---- 特殊 token id（紧跟真实类别之后）----
+        self.pitch_bos_id: int = self.pitch_vocab_size
+        self.pitch_eos_id: int = self.pitch_vocab_size + 1
+        self.duration_bos_id: int = self.duration_num_classes
+        self.duration_eos_id: int = self.duration_num_classes + 1
+        self.shift_bos_id: int = self.shift_num_classes
+        self.shift_eos_id: int = self.shift_num_classes + 1
+        self.pad_id: int = 0
+
+        # ---- 词表总大小（含特殊 token），供模型 embedding / 分类头使用 ----
+        self.pitch_vocab_total: int = self.pitch_vocab_size + self.num_special_tokens
+        self.duration_vocab_total: int = self.duration_num_classes + self.num_special_tokens
+        self.shift_vocab_total: int = self.shift_num_classes + self.num_special_tokens
 
     # ---------- 量化 ↔ 秒(或步) ----------
 
@@ -446,14 +485,402 @@ _DEFAULT_CODEC: Optional["CompoundEventCodec"] = None
 
 
 def get_compound_codec(cfg: Optional[dict] = None, reload: bool = False) -> CompoundEventCodec:
-    """获取默认复合事件编解码器（参数来自 configs/e1_compound_events.yaml）。"""
+    """获取默认复合事件编解码器（参数来自 configs/e1_compound_events.yaml）。
+
+    参数 cfg 既可以是 **codec 小节**（如 {"time_unit_sec": ...}），
+    也可以是**完整配置字典**（含 "codec" 键，内部自动取小节）。
+    """
     global _DEFAULT_CODEC
+    if isinstance(cfg, dict) and "codec" in cfg:
+        cfg = cfg["codec"]
     if reload or _DEFAULT_CODEC is None or cfg is not None:
         codec = CompoundEventCodec(cfg)
         if cfg is None:
             _DEFAULT_CODEC = codec
         return codec
     return _DEFAULT_CODEC
+
+
+# ==============================================================================
+# 三之三、E2：复合事件序列的窗口切分（256 事件 / 窗口）
+# ==============================================================================
+#
+# 设计要点：
+#   1. 窗口长度单位是**事件数**（= 复合序列长度），不是音符时间长度；
+#   2. 曲目 ID 隔离：窗口严格在单曲内部切，训练集 / 验证集曲目 ID 不相交，
+#      同曲切出的窗口不会跨集合；
+#   3. 训练集步长 128（50% 重叠），验证/测试集步长 = 窗口长度（非重叠）；
+#   4. 不足窗口长度的尾段**直接丢弃**，不做 padding；
+#   5. 每个窗口前后加 BOS / EOS，输入 = [BOS] + 窗口事件，目标 = 窗口事件 + [EOS]；
+#   6. **窗口最后一个事件的 time-shift 是伪标签**：window 尾部假想的"再下一个音符"
+#      不存在（生成时该事件之后就是 EOS），因此统一置 0，并在 target 中用
+#      IGNORE_INDEX 屏蔽，禁止参与反向传播（E1 自测报告硬性约束）。
+#
+# ⚠ 该掩码的代价（如实记录）：对于**非末尾窗口**（窗口中段切出的窗口），
+#   最后一个事件到下一个音符的真实 time-shift 在整曲序列中是可知的，
+#   本实现按 E1 约定一律视为未定义并屏蔽 → 每个窗口舍弃 1 个真实可得的
+#   shift 监督样本。选择一致处理而非"按位置区别对待"，是为了让模型在窗口
+#   尾部学到的语义始终是"该停了"，与自回归生成时"第 256 个事件后接 EOS"一致。
+# ==============================================================================
+
+# PyTorch CrossEntropyLoss 默认 ignore_index：标记"该位置不参与损失"
+IGNORE_INDEX: int = -100
+
+
+def encode_song_events(
+    song_id: str,
+    base_dir: Optional[str] = None,
+    codec: Optional[CompoundEventCodec] = None,
+) -> Optional[Dict[str, Any]]:
+    """整曲 → 复合事件 ID 序列（窗口切分的输入）。
+
+    参数:
+        song_id:  曲目 ID
+        base_dir: 数据根目录，默认 _DATASET_BASE
+        codec:    编解码器，默认 get_compound_codec()
+    返回:
+        {"song_id", "pitch_ids", "duration_ids", "shift_ids", "num_events", "stats"}；
+        加载失败返回 None
+    """
+    codec = codec if codec is not None else get_compound_codec()
+    annotations = load_song_annotations(song_id, base_dir if base_dir is not None else _DATASET_BASE)
+    if annotations is None:
+        return None
+
+    notes = annotations["midi"]["tracks"][0]["notes"]
+    notes = sorted(notes, key=lambda x: (float(x["start_time"]), int(x["note"])))
+    events = codec.encode_notes(notes)
+    return {
+        "song_id": song_id,
+        "pitch_ids": events["pitch_ids"],
+        "duration_ids": events["duration_ids"],
+        "shift_ids": events["shift_ids"],
+        "num_events": len(events["pitch_ids"]),
+        "stats": events["stats"],
+    }
+
+
+def slice_event_windows(
+    num_events: int, window_size: int, stride: int
+) -> List[Tuple[int, int]]:
+    """按 [start, end) 切出等长窗口；不足 window_size 的尾段直接丢弃（不 padding）。
+
+    参数:
+        num_events:  序列事件总数
+        window_size: 窗口长度（事件数）
+        stride:      滑动步长；stride == window_size 时为非重叠取样
+    返回:
+        [(start, end), ...]，每个窗口长度恒为 window_size
+    """
+    if num_events < window_size or window_size <= 0 or stride <= 0:
+        return []
+    return [(s, s + window_size) for s in range(0, num_events - window_size + 1, stride)]
+
+
+def build_window_sample(
+    song_events: Dict[str, Any],
+    start: int,
+    end: int,
+    codec: Optional[CompoundEventCodec] = None,
+) -> Dict[str, torch.Tensor]:
+    """由整曲事件序列切出一个窗口样本（含 BOS / EOS、attention_mask、ignore_index 掩码）。
+
+    序列布局（长度 = window_size + 1）：
+        输入 : [BOS] + e_0 ... e_{W-1}
+        目标 : e_0 ... e_{W-1} + [EOS]
+    time-shift 掩码：
+        目标序列中**最后一个事件位**与 **EOS 位**的 shift 均置 IGNORE_INDEX(-100)，
+        因为窗口最后一个事件之后不存在"下一个音符"（伪标签），EOS 也不是音符事件。
+
+    参数:
+        song_events: encode_song_events() 的返回
+        start/end:   窗口在整曲事件序列上的 [start, end) 区间
+        codec:       编解码器
+    返回:
+        样本字典（全部为 torch.long 张量）
+    """
+    codec = codec if codec is not None else get_compound_codec()
+
+    pitch_ids = list(song_events["pitch_ids"][start:end])
+    duration_ids = list(song_events["duration_ids"][start:end])
+    shift_ids = list(song_events["shift_ids"][start:end])
+
+    # ---- 窗口尾部 time-shift = 伪标签：置 0（未定义），训练阶段用 IGNORE_INDEX 屏蔽 ----
+    # （整曲编码时末尾 shift 已经是 0；此处对窗口切尾统一处理，保证任意窗口都成立）
+    shift_ids[-1] = codec.pad_id
+
+    seq_len = len(pitch_ids) + 1     # +1 = BOS（输入侧）/ EOS（目标侧）
+
+    input_pitch_ids = torch.tensor([codec.pitch_bos_id] + pitch_ids, dtype=torch.long)
+    input_duration_ids = torch.tensor([codec.duration_bos_id] + duration_ids, dtype=torch.long)
+    input_shift_ids = torch.tensor([codec.shift_bos_id] + shift_ids, dtype=torch.long)
+
+    target_pitch_ids = torch.tensor(pitch_ids + [codec.pitch_eos_id], dtype=torch.long)
+    target_duration_ids = torch.tensor(duration_ids + [codec.duration_eos_id], dtype=torch.long)
+
+    # shift 目标：最后一个事件位 + EOS 位 → IGNORE_INDEX
+    shift_target = list(shift_ids)
+    shift_target[-1] = IGNORE_INDEX
+    shift_target.append(IGNORE_INDEX)
+    target_shift_ids = torch.tensor(shift_target, dtype=torch.long)
+
+    attention_mask = torch.ones(seq_len, dtype=torch.long)
+
+    return {
+        "input_pitch_ids": input_pitch_ids,
+        "input_duration_ids": input_duration_ids,
+        "input_shift_ids": input_shift_ids,
+        "target_pitch_ids": target_pitch_ids,
+        "target_duration_ids": target_duration_ids,
+        "target_shift_ids": target_shift_ids,
+        "attention_mask": attention_mask,
+    }
+
+
+class CompoundEventWindowDataset(Dataset):
+    """E2 复合事件窗口数据集：样本 = 一个固定长度（默认 256 事件）的窗口。
+
+    与旧 NanyinDataset（每首曲目一个样本）的区别：
+      - 样本粒度 = 窗口，不再是整曲；
+      - 每个样本自带 BOS/EOS、attention_mask 与 time-shift 伪标签掩码；
+      - 不再提供 target_tempo_dist / target_mode_dist 等全局级字段
+        （E2 只做三路分类 CE，全局级真值待 E3 需要时再接入）。
+
+    __getitem__ 返回:
+        {
+          "input_*_ids"/"target_*_ids"/"attention_mask": torch.long 张量,
+          "song_id": str, "split": str, "start": int, "end": int, "window_index": int
+        }
+    """
+
+    def __init__(
+        self,
+        song_ids: List[str],
+        split: str,
+        cfg: Optional[dict] = None,
+        base_dir: Optional[str] = None,
+        verbose: bool = True,
+    ):
+        """
+        参数:
+            song_ids: 曲目 ID 列表（训练集与验证集必须不相交 → 曲目 ID 隔离）
+            split:    "train" | "val"（决定滑动步长）
+            cfg:      配置字典，默认加载 configs/e2_compound_window.yaml
+            base_dir: 数据根目录
+            verbose:  是否打印窗口统计与截断曲目清单
+        """
+        super().__init__()
+        self.cfg = cfg if cfg is not None else load_config(E2_CONFIG_PATH)
+        self.window_cfg = self.cfg["window"]
+        self.window_size: int = int(self.window_cfg["window_size_events"])
+        self.drop_tail: bool = bool(self.window_cfg["drop_tail"])
+        if split == "train":
+            self.stride: int = int(self.window_cfg["train_stride_events"])
+        elif split in ("val", "test", "eval"):
+            self.stride = int(self.window_cfg["eval_stride_events"])
+        else:
+            raise ValueError(f"[dataset_nanyin] 未知 split: {split}（应为 train/val）")
+
+        self.split = split
+        self.song_ids = list(song_ids)
+        self.base_dir = base_dir if base_dir is not None else _DATASET_BASE
+        self.codec = get_compound_codec(self.cfg)
+
+        # 窗口索引表 + 整曲事件缓存（11 首曲目，一次性编码，避免每 sample 重复读 MIDI）
+        self.records: List[Dict[str, Any]] = []
+        self._song_events: Dict[str, Dict[str, Any]] = {}
+        self._song_stats_rows: List[Dict[str, Any]] = []
+
+        for song_id in self.song_ids:
+            song_events = encode_song_events(song_id, self.base_dir, self.codec)
+            if song_events is None:
+                print(f"[dataset_nanyin] 窗口构建跳过（GT 加载失败）: {song_id}")
+                continue
+            self._song_events[song_id] = song_events
+
+            num_events = int(song_events["num_events"])
+            starts = slice_event_windows(num_events, self.window_size, self.stride)
+            covered_tail = starts[-1][1] if starts else 0
+            discarded_tail = num_events - covered_tail      # 未被任何窗口覆盖的尾部事件数
+
+            for w_idx, (s, e) in enumerate(starts):
+                self.records.append({
+                    "song_id": song_id,
+                    "split": self.split,
+                    "start": int(s),
+                    "end": int(e),
+                    "window_index": int(w_idx),
+                })
+
+            encode_stats = song_events["stats"]
+            self._song_stats_rows.append({
+                "song_id": song_id,
+                "split": self.split,
+                "num_events": num_events,
+                "truncated_notes": int(encode_stats["truncated_notes"]),
+                "duration_overflow": int(encode_stats["duration_overflow"]),
+                "shift_overflow": int(encode_stats["shift_overflow"]),
+                "negative_gap_clamped": int(encode_stats["negative_gap_clamped"]),
+                "num_windows": len(starts),
+                "discarded_tail_events": int(discarded_tail),
+            })
+
+        if verbose:
+            self.print_statistics()
+
+    # ---------- 基本接口 ----------
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        rec = self.records[idx]
+        song_events = self._song_events[rec["song_id"]]
+        sample = build_window_sample(
+            song_events, rec["start"], rec["end"], codec=self.codec
+        )
+        sample.update({
+            "song_id": rec["song_id"],
+            "split": rec["split"],
+            "start": int(rec["start"]),
+            "end": int(rec["end"]),
+            "window_index": int(rec["window_index"]),
+        })
+        return sample
+
+    # ---------- 统计 / 台账 ----------
+
+    def song_stats_rows(self) -> List[Dict[str, Any]]:
+        """逐曲统计行（用于窗口数量统计清单 CSV）。"""
+        return list(self._song_stats_rows)
+
+    def truncated_songs(self) -> List[Dict[str, Any]]:
+        """被 codec.max_notes 截断的曲目清单（E2 硬性要求：必须如实打印记录）。"""
+        return [r for r in self._song_stats_rows if r["truncated_notes"] > 0]
+
+    def window_size_events(self) -> int:
+        return self.window_size
+
+    def print_statistics(self) -> None:
+        """打印窗口切分统计（含被 max_notes 截断的曲目清单）。"""
+        total_windows = len(self.records)
+        total_events = sum(r["num_events"] for r in self._song_stats_rows)
+        total_disc = sum(r["discarded_tail_events"] for r in self._song_stats_rows)
+        print(f"[dataset_nanyin] ===== 复合事件窗口统计 [{self.split}] =====")
+        print(f"  窗口长度={self.window_size} 事件, 步长={self.stride} "
+              f"({'非重叠' if self.stride >= self.window_size else '滑动重叠'}), drop_tail={self.drop_tail}")
+        print(f"  曲目数={len(self._song_stats_rows)}, 窗口数={total_windows}, "
+              f"事件总数={total_events}, 尾部丢弃事件数={total_disc}")
+        print(f"  {'曲目':<28}{'事件数':>8}{'窗口数':>8}{'尾丢弃':>8}{'max_notes截断':>14}")
+        for r in self._song_stats_rows:
+            print(f"  {r['song_id']:<28}{r['num_events']:>8}{r['num_windows']:>8}"
+                  f"{r['discarded_tail_events']:>8}{r['truncated_notes']:>14}")
+        truncated = self.truncated_songs()
+        if truncated:
+            print(f"  ⚠ 被 max_notes={self.codec.max_notes} 截断的曲目清单（共 {len(truncated)} 首）：")
+            for r in truncated:
+                print(f"      - {r['song_id']}: 丢弃 {r['truncated_notes']} 个音符 "
+                      f"（保留 {r['num_events']}）")
+        else:
+            print(f"  未被 max_notes={self.codec.max_notes} 截断的曲目（0 首截断）")
+
+
+def get_compound_window_datasets(
+    cfg: Optional[dict] = None,
+    base_dir: Optional[str] = None,
+    verbose: bool = True,
+) -> Tuple[CompoundEventWindowDataset, CompoundEventWindowDataset]:
+    """构建 E2 训练集 / 验证集窗口数据集（曲目 ID 固定划分，与 E0~exp3 一致）。"""
+    cfg = cfg if cfg is not None else load_config(E2_CONFIG_PATH)
+    train_ds = CompoundEventWindowDataset(
+        song_ids=TRAIN_SPLIT_IDS, split="train", cfg=cfg, base_dir=base_dir, verbose=verbose
+    )
+    val_ds = CompoundEventWindowDataset(
+        song_ids=VAL_SPLIT_IDS, split="val", cfg=cfg, base_dir=base_dir, verbose=verbose
+    )
+
+    # 曲目 ID 隔离自检（防止划分被误改导致同曲窗口跨集）
+    overlap = set(TRAIN_SPLIT_IDS) & set(VAL_SPLIT_IDS)
+    if overlap:
+        raise RuntimeError(f"[dataset_nanyin] 训练/验证曲目 ID 存在交集，违反曲目隔离: {overlap}")
+    return train_ds, val_ds
+
+
+def collate_compound_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """E2 窗口样本 collate：张量堆叠，字符串/标量元数据收集为 list。"""
+    tensor_keys = [
+        "input_pitch_ids", "input_duration_ids", "input_shift_ids",
+        "target_pitch_ids", "target_duration_ids", "target_shift_ids",
+        "attention_mask",
+    ]
+    meta_keys = ["song_id", "split", "start", "end", "window_index"]
+    collated: Dict[str, Any] = {}
+    for key in tensor_keys:
+        collated[key] = torch.stack([b[key] for b in batch], dim=0)
+    for key in meta_keys:
+        collated[key] = [b[key] for b in batch]
+    return collated
+
+
+def compute_vocab_class_stats(
+    dataset: CompoundEventWindowDataset,
+    top_k: int = 10,
+    long_tail_threshold: int = 5,
+) -> Dict[str, Any]:
+    """统计 duration / time-shift 词表各类别的样本出现频次（监控长尾类别）。
+
+    统计口径：**只统计真正参与损失的监督位置**
+      - duration：目标序列全部位置（含 EOS 位）；
+      - shift  ：跳过 IGNORE_INDEX 位置（窗口尾伪标签 + EOS）。
+
+    参数:
+        dataset: 窗口数据集
+        top_k:   打印频次最高的 K 个类别
+        long_tail_threshold: 频次 <= 该值计为长尾类别
+    返回:
+        {"num_windows", "num_events", "duration": {...}, "shift": {...}}
+    """
+    codec = dataset.codec
+    duration_counts = np.zeros(codec.duration_vocab_total, dtype=np.int64)
+    shift_counts = np.zeros(codec.shift_vocab_total, dtype=np.int64)
+    num_events = 0
+
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        tgt_dur = sample["target_duration_ids"].numpy()
+        tgt_shift = sample["target_shift_ids"].numpy()
+        duration_counts += np.bincount(tgt_dur, minlength=codec.duration_vocab_total)
+        valid_shift = tgt_shift[tgt_shift != IGNORE_INDEX]
+        shift_counts += np.bincount(valid_shift, minlength=codec.shift_vocab_total)
+        num_events += int(sample["attention_mask"].shape[0]) - 1   # 窗口事件数（去掉 BOS/EOS 侧）
+
+    def _summarize(counts: np.ndarray) -> Dict[str, Any]:
+        total = int(counts.sum())
+        used = int((counts > 0).sum())
+        zero = int((counts == 0).sum())
+        tail_mask = (counts > 0) & (counts <= long_tail_threshold)
+        tail_classes = int(tail_mask.sum())
+        tail_tokens = int(counts[tail_mask].sum())
+        top_idx = np.argsort(-counts)[:top_k]
+        top = [{"class_id": int(i), "count": int(counts[i])} for i in top_idx if counts[i] > 0]
+        return {
+            "num_classes": int(counts.shape[0]),
+            "used_classes": used,
+            "zero_count_classes": zero,
+            "total_tokens": total,
+            "long_tail_threshold": int(long_tail_threshold),
+            "long_tail_classes": tail_classes,
+            "long_tail_token_share": float(tail_tokens / total) if total else 0.0,
+            "top_classes": top,
+            "counts": [int(c) for c in counts],
+        }
+
+    return {
+        "num_windows": len(dataset),
+        "num_events": int(num_events),
+        "duration": _summarize(duration_counts),
+        "shift": _summarize(shift_counts),
+    }
 
 
 # ==============================================================================
