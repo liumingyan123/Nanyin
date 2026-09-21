@@ -397,7 +397,8 @@ class NanyinBoYaTCN(nn.Module):
             max_seq_len:     最大序列长度
             dropout:         Dropout概率
             pitch_vocab_size / duration_vocab_size / shift_vocab_size:
-                E1 复合事件三路属性词表大小；None 时从 configs/e1_compound_events.yaml 读取
+                E1 复合事件三路属性词表大小（**含 BOS/EOS 特殊 token**）；
+                None 时从 configs/e1_compound_events.yaml 读取（真实类别数 + num_special_tokens）
         """
         super().__init__()
         self.vocab_size = vocab_size
@@ -406,17 +407,19 @@ class NanyinBoYaTCN(nn.Module):
         # ---- 复合事件（E1）词表大小：优先取显式入参，回退 YAML 配置 ----
         # 规则：影响结果的参数不得硬编码，统一来自 configs/e1_compound_events.yaml
         codec_cfg = get_section("codec")
+        # E2：真实类别之上追加 BOS / EOS 两个特殊 token（见 dataset_nanyin.CompoundEventCodec）
+        _num_special = int(codec_cfg.get("num_special_tokens", 0))
         self.pitch_vocab_size = int(
             pitch_vocab_size if pitch_vocab_size is not None
-            else codec_cfg["pitch_vocab_size"]
+            else codec_cfg["pitch_vocab_size"] + _num_special
         )
         self.duration_vocab_size = int(
             duration_vocab_size if duration_vocab_size is not None
-            else codec_cfg["duration_max_steps"] + 2      # 0=PAD, 1..max 精确档, max+1=溢出档
+            else codec_cfg["duration_max_steps"] + 2 + _num_special  # 0=PAD, 1..max 精确档, max+1=溢出档, +BOS/EOS
         )
         self.shift_vocab_size = int(
             shift_vocab_size if shift_vocab_size is not None
-            else codec_cfg["shift_max_steps"] + 2
+            else codec_cfg["shift_max_steps"] + 2 + _num_special
         )
 
         # ---- Token嵌入 + 位置编码 ----
@@ -673,18 +676,20 @@ class NanyinMusicMamba(nn.Module):
         self.d_model = d_model
 
         # ---- 复合事件（E1）词表大小：优先取显式入参，回退 YAML 配置 ----
+        # E2：真实类别之上追加 BOS / EOS 两个特殊 token（与 BoYaTCN 口径一致）
         codec_cfg = get_section("codec")
+        _num_special = int(codec_cfg.get("num_special_tokens", 0))
         self.pitch_vocab_size = int(
             pitch_vocab_size if pitch_vocab_size is not None
-            else codec_cfg["pitch_vocab_size"]
+            else codec_cfg["pitch_vocab_size"] + _num_special
         )
         self.duration_vocab_size = int(
             duration_vocab_size if duration_vocab_size is not None
-            else codec_cfg["duration_max_steps"] + 2
+            else codec_cfg["duration_max_steps"] + 2 + _num_special
         )
         self.shift_vocab_size = int(
             shift_vocab_size if shift_vocab_size is not None
-            else codec_cfg["shift_max_steps"] + 2
+            else codec_cfg["shift_max_steps"] + 2 + _num_special
         )
 
         # ---- Token嵌入 + 位置编码 ----
