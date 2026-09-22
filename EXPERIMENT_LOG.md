@@ -462,3 +462,54 @@ file-level 比较必须两侧同键 `(start, note)` 排序；
 | `embedding_symbolic_umap.png` / `embedding_symbolic_tsne.png` | E0 四类降维图（`visualize_embedding.py` 无参数运行）|
 | `exp2_train_*.log`、`exp2_train_summary_*.json`、`experiment_record_exp2_*.csv`、`exp2_recipe/` | exp2 训练日志/汇总/超参快照 |
 | `comparison_openstyle_ablation.csv`、`generated_ensemble*`、`gt_*`、各 `*.log` | 更早的风格消融/合奏/音频实验产物（历史线，与 E0~exp3 主线无关）|
+
+---
+
+## 6. E3 损失消融实验（分支 `experiment/E3_loss_ablation`）
+
+分支来源：`feature/E2_window_training`（基准 commit `ec4bd97`）→ 新建 `experiment/E3_loss_ablation`。
+分支纪律：旧预实验分支 `fix/evaluation-umap`、`exp2`、`exp3_window_inference` 只读；
+`feature/E2_window_training` 冻结，E2（`ec4bd97`）作为唯一对照基线；E3 不改动 E2 代码与产物。
+
+### 6.0 前置背景：E2 基线现象（E3 所有指标均与之对照）
+
+| 现象 | E2 实测（`ec4bd97`） |
+|---|---|
+| 样本量 | 248 训练窗口 / 10 验证窗口（9 训练曲 + 2 验证曲）——小样本 |
+| 过拟合 | train 总损失 9.34 → 1.84；val 总损失 epoch 7 见底 **6.8788** → 10.19（早停 epoch 27，patience 20） |
+| duration 头 | 验证 token 准确率仅 **7.00%**（低于多数类基线 ≈10.8%），404 细档长尾稀疏（219 类零样本） |
+| 其余头 | val token 准确率 pitch 36.07% / shift 23.22% |
+
+E3 目标：主干、窗口切分、数据、超参全部固定，只改损失组合，加入**基于生成头 logits** 的南音分布约束
+（音级 / 调式 / 时值 / IOI），观察过拟合程度与 duration 准确率的变化。
+
+### 6.1 代码改动
+
+| 文件 | 改动 |
+|---|---|
+| `models.py` | `NanyinBoYaTCN` / `NanyinMusicMamba` 新增 `use_features_head` / `use_style_head`（**默认 False**）：独立辅助头 features_head（MFCC 回归）、style_head（随机投影风格嵌入）默认不创建、不参与前向、forward 返回 None。→ 所有南音分布约束只能作用于 pitch_head / duration_head / shift_head 的最终 logits。noef 老链路（`loss_nanyin.nanyin_total_loss` 与两个训练脚本）做 None 兜底（风格损失记 0），不报错。 |
+| `loss_nanyin.py` | 新增第九节"E3 可微分布损失"：`build_pitch_class_matrix`（128→12 音级）、`build_value_bin_matrix`（类别秒值→直方图 bin）、`build_mode_distribution_matrix`（南音四调五声音级先验）、公共内核 `soft_histogram_kl`（softmax→软直方图→KL，全程可微）、`pitch_class_distribution_loss`、`mode_distribution_loss`、`duration_distribution_loss`、`shift_ioi_distribution_loss`、`ornament_density_distribution_loss`（L5 框架）。 |
+| `dataset_nanyin.py` | 新增 `resolve_window_mode_index()`，窗口样本新增 `target_mode_index`（窗口音级直方图匹配南音四调 → 回退曲目级 → 回退五空管）；`collate_compound_batch` 同步 stack；新增 `mode_index_counts()` 供训练日志记录调式真值分布。 |
+| `train_boyatcn.py` | 新增 `--config`（覆盖层 YAML）；`build_distribution_matrices()` 构造常量聚合矩阵；`compute_compound_loss` / `evaluate_compound` 支持 4 项分布损失 + L5 装饰损失权重；**早停/最优判定改为监控"三路加权 CE"**（与 E2 同口径，跨组可比，分布损失只参与优化）；逐轮 CSV 新增 `train/val_pc_kl`、`train/val_mode_kl`、`train/val_dur_dist_kl`、`train/val_ioi_dist_kl`、`train/val_ornament_kl`、`train/val_ce_total` 列；输出路径支持 `{seed}` 模板；训练结束自动调用 `plot_loss_curve.py` 出图。 |
+| `configs/e3_L0.yaml` ~ `configs/e3_L5.yaml` | 每组一份覆盖层配置（超参/窗口/数据逐位继承 E2；四项分布损失权重统一取 1.0 或 0.0，未做逐组调参；含 `distribution` 分箱真源与 `{seed}` 产物路径）。 |
+| `tests/test_loss_gradient.py` | E3 梯度单元测试（G0 辅助头停用 + G1~G5 五项损失梯度 + G6 掩码/调式链路）。 |
+
+> 说明：L0 与 E2 的损失口径一致，但**不是** bit-identical 复现——E3 移除了两个辅助头，参数总量与初始化
+> RNG 流发生变化。跨阶段对照以"指标量级与趋势"为准。
+
+### 6.2 梯度单元测试（`tests/test_loss_gradient.py`）
+
+- 分支：`experiment/E3_loss_ablation`；commit：`da8c9b2`；运行日期：2026-09-22；设备：cuda（RTX 3060 Laptop）
+- 结果：**18/18 项 PASS**，无一项梯度为 0 → 允许启动 L0-L4 消融训练
+- 明细产物：`results/e3_gradient_test.json`（git 排除），标准输出留档 `results/e3_gradient_test_stdout.txt`
+
+| 损失项 | 期望受约束的头 | loss 初值 | pitch_head | duration_head | shift_head | 判定 |
+|---|---|---|---|---|---|---|
+| G1 音级(pitch-class)分布 KL | pitch_head | 0.6384 | **0.5522** | 0.0 | 0.0 | PASS |
+| G2 时值(duration)分布 KL | duration_head | 2.5582 | 0.0 | **1.1561** | 0.0 | PASS |
+| G3 IOI(time-shift)分布 KL | shift_head | 3.2681 | 0.0 | 0.0 | **1.1385** | PASS |
+| G4 调式(mode)符合度 KL | pitch_head | 0.8486 | **0.6036** | 0.0 | 0.0 | PASS |
+| G5 装饰音密度（L5 框架） | duration_head | 0.0718 | 0.0 | **0.0047** | 0.0 | PASS |
+
+附加校验：G0 五个辅助头停用项 PASS；G6 shift 目标含 4 个 IGNORE_INDEX 掩码位（2 窗口 × 2：末尾伪标签 + EOS），
+去掉掩码后 IOI 损失由 3.317358 → 3.327659（证明掩码确实生效）；调式真值解析（五空管音级 → 0）PASS。
