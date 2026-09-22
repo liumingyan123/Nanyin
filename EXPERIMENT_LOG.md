@@ -513,3 +513,24 @@ E3 目标：主干、窗口切分、数据、超参全部固定，只改损失�
 
 附加校验：G0 五个辅助头停用项 PASS；G6 shift 目标含 4 个 IGNORE_INDEX 掩码位（2 窗口 × 2：末尾伪标签 + EOS），
 去掉掩码后 IOI 损失由 3.317358 → 3.327659（证明掩码确实生效）；调式真值解析（五空管音级 → 0）PASS。
+
+### 6.3 L0 组结果（基础三路事件 CE，无分布损失）
+
+- 配置：`configs/e3_L0.yaml`；命令：`train_boyatcn.py --mode compound --config configs/e3_L0.yaml --seed {2026,2027,2028}`
+- 超参/窗口/掩码完全继承 E2：bs=16, lr=1e-3, StepLR(50, 0.5), patience=20, 上限 200 epoch，窗口 256 事件 / 训练步长 128 / 验证步长 256，shift 末尾伪标签仍用 ignore_index 屏蔽
+- 模型：`NanyinBoYaTCN`（3,426,717 可训练参数；features_head / style_head 已停用）
+
+| seed | 总轮数 | best epoch | best val 三路加权 CE | best 轮 train total | val token acc pitch / duration / shift (%) | 末轮 val CE | 末轮 train total |
+|---|---|---|---|---|---|---|---|
+| 2026 | 27 | 7 | **6.8788** | 5.9980 | 36.07 / 7.00 / 23.22 | 10.1936 | 1.8382 |
+| 2027 | 26 | 6 | 6.8957 | 6.1677 | 35.29 / 6.15 / 23.65 | 10.0053 | 1.9213 |
+| 2028 | 27 | 7 | 6.8795 | 5.9971 | 35.99 / 7.63 / 23.53 | 10.2115 | 1.7851 |
+| **均值** | 26.7 | 6.7 | **6.8813** | 6.0543 | 35.78 / 6.93 / 23.47 | 10.1368 | 1.8482 |
+
+**Sanity check（重要）**：L0 seed=2026 与 E2 基线（`ec4bd97`）**逐位复现** —— best val 损失同为 **6.8788**，三路 token 准确率同为 36.07 / 7.00 / 23.22。
+原因：features_head / style_head 在 `models.py` 中位于三个生成头之后创建且不参与前向，停用不改变三个生成头的初始化随机数流，前向计算也未受牵连。→ L0 是 E2 的严格复现，后续跨组对照可信。
+
+**过拟合现象（三籽一致）**：train total 5.998 → 1.838（降约 3.3×），val CE 6.879 → 10.194（升约 48%），best-val 全部出现在 epoch 6~7。
+**duration 头依然没学到**：best 轮 token 准确率 6.15~7.63%（多数类基线约 10.8%），与 E2 的 7.00% 同水平 → 不是随机波动，而是结构性问题（404 细档长尾稀疏，219 类零样本）。
+
+产物：`results/e3/L0_seed{2026,2027,2028}_train.log` 与 `_train_log.csv`、`checkpoints/e3/L0_seed*/best_valloss_model.pt`、`reports/e3/L0_seed*_loss_curve.png`。
