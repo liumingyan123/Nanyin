@@ -506,8 +506,15 @@ def nanyin_total_loss(
     print(f"[总损失] 调式损失(λ4={lambda4}) = {mode_loss.item():.6f}")
 
     # ---- 6. 风格损失 ----
-    style_loss = (fad_diff(target_dict["pred_features"], target_dict["target_features"]) +
-                  style_cosine_loss(target_dict["pred_style"], target_dict["target_style"]))
+    # E3：models.py 的 features_head / style_head 已默认停用（前向返回 None），
+    # 此处若两个头均未启用则风格损失取 0，避免 noef 老链路因缺字段而报错。
+    _pf = target_dict.get("pred_features")
+    _ps = target_dict.get("pred_style")
+    if _pf is None or _ps is None:
+        style_loss = torch.zeros((), device=ce_loss.device, dtype=ce_loss.dtype)
+    else:
+        style_loss = (fad_diff(_pf, target_dict["target_features"]) +
+                      style_cosine_loss(_ps, target_dict["target_style"]))
     print(f"[总损失] 风格损失(λ5={lambda5}) = {style_loss.item():.6f}")
 
     # ---- 7. 加权总损失 ----
@@ -529,3 +536,240 @@ def nanyin_total_loss(
     print(f"=" * 60)
 
     return total
+
+
+# ==============================================================================
+# 九、E3：可微分布损失（**全部基于生成头 logits 计算**）
+# ==============================================================================
+#
+# 设计约束（E3）：
+#   1) 所有南音分布约束**必须**由模型最终生成输出（pitch_head / duration_head /
+#      shift_head 的 logits）经 softmax 聚合得到，不得再经由与生成无关的独立
+#      辅助头（features_head / style_head，E3 已停用）间接约束。
+#   2) 全程可微：聚合矩阵为常量（不参与梯度），梯度经 softmax → 直方图 → KL
+#      一路回传到对应输出头，梯度单元测试见 tests/test_loss_gradient.py。
+#   3) 掩码规则继承 E2：time-shift 末尾伪标签位（IGNORE_INDEX=-100）与 EOS 位
+#      一律不进入分布统计。
+#
+# 统一口径：把"词表类别 → 语义桶（音级 / 秒级直方图 bin）"写成常量聚合矩阵 A，
+#   pred_hist = mean_positions( softmax(logits)[:, :, :C_real] @ A )
+#   targ_hist = mean_positions( A[target_ids] )          （one-hot 落入桶）
+#   loss      = KL(targ_hist ‖ pred_hist)
+# 于是四种损失共用同一个 soft_histogram_kl() 内核，只是 A 不同。
+# ==============================================================================
+
+
+def build_pitch_class_matrix(num_pitch_classes: int = 128) -> torch.Tensor:
+    """音级聚合矩阵 A：(num_pitch_classes, 12)，A[i, i % 12] = 1（MIDI 音高 → pitch class）。"""
+    idx = torch.arange(int(num_pitch_classes), dtype=torch.long)
+    a = torch.zeros(int(num_pitch_classes), 12, dtype=torch.float32)
+    a[idx, idx % 12] = 1.0
+    return a
+
+
+def build_value_bin_matrix(class_seconds, bin_edges) -> torch.Tensor:
+    """秒值 → 直方图 bin 的聚合矩阵 A：(num_classes, num_bins)，每行 one-hot。
+
+    参数:
+        class_seconds: 长度 num_classes 的序列，第 i 项 = 类别 i 对应的物理秒值
+                       （duration 用 codec.index_to_duration，shift 用 codec.index_to_shift）
+        bin_edges:     长度 num_bins + 1 的分箱边界（秒），左闭右开，最后一箱含上界
+    """
+    import numpy as np
+
+    seconds = np.asarray(list(class_seconds), dtype=np.float64)
+    edges = np.asarray(list(bin_edges), dtype=np.float64)
+    if edges.ndim != 1 or edges.size < 2:
+        raise ValueError("[loss_nanyin] bin_edges 必须是长度 >= 2 的一维序列")
+    num_bins = edges.size - 1
+    # np.digitize(x, edges[1:-1]) → 0 .. num_bins-1（右开区间，最后一箱吸收上界）
+    bin_idx = np.digitize(seconds, edges[1:-1], right=False).astype(np.int64)
+    bin_idx = np.clip(bin_idx, 0, num_bins - 1)
+    a = torch.zeros(len(seconds), num_bins, dtype=torch.float32)
+    a[torch.arange(len(seconds)), torch.from_numpy(bin_idx)] = 1.0
+    return a
+
+
+def build_mode_distribution_matrix() -> torch.Tensor:
+    """调式 → 12 维音级先验分布，shape=(4, 12)，行内在其五声音级上均匀分布。
+
+    调式顺序与 dataset_nanyin.MODE_TO_INDEX / NANYIN_FOUR_MODES 保持一致：
+        ["五空管", "五空四仪管", "倍思管", "四空管"]
+    """
+    # 懒加载，避免与 dataset_nanyin 形成顶层循环导入；保持调式音级集合单一真源
+    from dataset_nanyin import _MODE_PENTATONIC  # type: ignore[attr-defined]
+
+    m = torch.zeros(4, 12, dtype=torch.float32)
+    for name, index in (("五空管", 0), ("五空四仪管", 1), ("倍思管", 2), ("四空管", 3)):
+        pcs = _MODE_PENTATONIC[name]
+        m[index, torch.tensor(pcs, dtype=torch.long)] = 1.0 / len(pcs)
+    return m
+
+
+def soft_histogram_kl(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    bin_matrix: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """可微"软直方图"KL 损失（E3 四种分布损失的公共内核）。
+
+    参数:
+        logits:      生成头 logits, shape=(batch, seq_len, C)（C 可 >= bin_matrix 行数，
+                     多余列视为特殊 token / 溢出档，直接截断不参与分布统计）
+        target_ids:  目标类别 id, shape=(batch, seq_len), long
+        bin_matrix:  聚合矩阵 (C_real, num_bins)，行 = 类别所属语义桶的 one-hot
+        valid_mask:  可选 bool 掩码 (batch, seq_len)，False 位置不计入直方图
+        eps:         数值平滑项
+    返回:
+        KL(targ_hist ‖ pred_hist)，batchmean 标量张量（可微 → 梯度回传 logits）
+    """
+    if logits.dim() != 3:
+        raise ValueError(f"[loss_nanyin] logits 需为 (B, L, C)，实际 {tuple(logits.shape)}")
+    num_real = int(bin_matrix.shape[0])
+    bin_matrix = bin_matrix.to(device=logits.device, dtype=torch.float32)
+
+    if valid_mask is None:
+        valid_mask = torch.ones_like(target_ids, dtype=torch.bool)
+    # 目标 id 越界（特殊 token / IGNORE_INDEX 负值 / EOS）一律剔除
+    valid_mask = valid_mask & (target_ids >= 0) & (target_ids < num_real)
+
+    probs = torch.softmax(logits[..., :num_real].float(), dim=-1)      # (B, L, C_real)
+    pred_bin = probs @ bin_matrix                                      # (B, L, K)
+    tgt_bin = bin_matrix[target_ids.clamp(min=0, max=num_real - 1)]     # (B, L, K)
+
+    w = valid_mask.to(pred_bin.dtype)
+    denom = w.sum(dim=1, keepdim=True).clamp(min=1.0)                  # (B, 1)
+    pred_hist = (pred_bin * w.unsqueeze(-1)).sum(dim=1) / denom        # (B, K)
+    targ_hist = (tgt_bin * w.unsqueeze(-1)).sum(dim=1) / denom         # (B, K)
+
+    pred_hist = pred_hist + eps
+    pred_hist = pred_hist / pred_hist.sum(dim=-1, keepdim=True)
+    targ_hist = targ_hist + eps
+    targ_hist = targ_hist / targ_hist.sum(dim=-1, keepdim=True)
+
+    return F.kl_div(pred_hist.log(), targ_hist, reduction="batchmean")
+
+
+def pitch_class_distribution_loss(
+    pitch_logits: torch.Tensor,
+    target_pitch_ids: torch.Tensor,
+    pc_matrix: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """L1：音级（pitch-class）分布损失 —— 基于 pitch_head logits。
+
+    softmax(pitch_logits) 按 MIDI 音高模 12 聚合为 12 维音级分布，与窗口真实
+    音级直方图做 KL。→ 梯度回传 pitch_head。
+    """
+    num_real = int(pc_matrix.shape[0]) if pc_matrix is not None else 128
+    if pc_matrix is None:
+        pc_matrix = build_pitch_class_matrix(num_real)
+    return soft_histogram_kl(pitch_logits, target_pitch_ids, pc_matrix, valid_mask)
+
+
+def mode_distribution_loss(
+    pitch_logits: torch.Tensor,
+    target_mode_index: torch.Tensor,
+    pc_matrix: torch.Tensor | None = None,
+    mode_dist_matrix: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """L2：调式（mode）符合度损失 —— 基于 pitch_head logits。
+
+    预测侧：与音级损失同一套聚合，得到窗口级 12 维音级分布；
+    目标侧：窗口所属南音调式的五声音级先验（该调 5 个音级上均匀分布）。
+    → 梯度回传 pitch_head（不使用独立的 mode_head，符合 E3 "约束必须作用于生成输出"的要求）。
+
+    参数:
+        target_mode_index: (batch,) long，窗口级调式索引（0..3，见 build_mode_distribution_matrix）
+    """
+    num_real = int(pc_matrix.shape[0]) if pc_matrix is not None else 128
+    if pc_matrix is None:
+        pc_matrix = build_pitch_class_matrix(num_real)
+    if mode_dist_matrix is None:
+        mode_dist_matrix = build_mode_distribution_matrix()
+
+    pc_matrix = pc_matrix.to(device=pitch_logits.device, dtype=torch.float32)
+    mode_dist_matrix = mode_dist_matrix.to(device=pitch_logits.device, dtype=torch.float32)
+
+    probs = torch.softmax(pitch_logits[..., :num_real].float(), dim=-1)   # (B, L, C_real)
+    pred_bin = probs @ pc_matrix                                          # (B, L, 12)
+    if valid_mask is None:
+        pred_hist = pred_bin.mean(dim=1)
+    else:
+        w = valid_mask.to(pred_bin.dtype)
+        pred_hist = (pred_bin * w.unsqueeze(-1)).sum(dim=1) / w.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+    targ_hist = mode_dist_matrix[target_mode_index.long().clamp(min=0, max=3)]  # (B, 12)
+
+    pred_hist = pred_hist + 1e-8
+    pred_hist = pred_hist / pred_hist.sum(dim=-1, keepdim=True)
+    targ_hist = targ_hist + 1e-8
+    targ_hist = targ_hist / targ_hist.sum(dim=-1, keepdim=True)
+    return F.kl_div(pred_hist.log(), targ_hist, reduction="batchmean")
+
+
+def duration_distribution_loss(
+    duration_logits: torch.Tensor,
+    target_duration_ids: torch.Tensor,
+    bin_matrix: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """L3：时值（duration）分布损失 —— 基于 duration_head logits。
+
+    把 402 个 duration 类别按"秒级直方图 bin"聚合（缓解 404 细档长尾稀疏），
+    与窗口真实时值直方图做 KL。→ 梯度回传 duration_head。
+    """
+    return soft_histogram_kl(duration_logits, target_duration_ids, bin_matrix, valid_mask)
+
+
+def shift_ioi_distribution_loss(
+    shift_logits: torch.Tensor,
+    target_shift_ids: torch.Tensor,
+    bin_matrix: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """L3：IOI（time-shift）分布损失 —— 基于 shift_head logits。
+
+    把 1002 个 shift 类别按"IOI 秒级直方图 bin"聚合，与窗口真实 IOI 直方图做 KL。
+    窗口末尾伪标签位（IGNORE_INDEX=-100）与 EOS 位由 valid_mask 剔除。
+    → 梯度回传 shift_head。
+    """
+    if valid_mask is None:
+        valid_mask = target_shift_ids != -100          # IGNORE_INDEX（dataset_nanyin）
+    return soft_histogram_kl(shift_logits, target_shift_ids, bin_matrix, valid_mask)
+
+
+def ornament_density_distribution_loss(
+    duration_logits: torch.Tensor,
+    target_short_mask: torch.Tensor,
+    short_class_mask: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """L5：**代码框架**（当前不纳入正式消融，原因见 EXERIMENT_LOG / E3 汇总报告）——
+    装饰音密度分布损失，基于 duration_head logits。
+
+    南音装饰音的经验判据是"短音 + 邻音跳进"（见 dataset_nanyin.build_target_dict 的
+    启发式）。本损失只取其中的**时值维度**：把 duration_head 的 softmax 概率质量在
+    "短音类别"（秒值 <= 阈值）上的总和作为"预测短音比例"，与 GT 短音比例做 MSE。
+    → 梯度回传 duration_head（不使用任何独立辅助头）。
+
+    参数:
+        target_short_mask: (batch, seq_len) bool/float，GT 事件是否为短音（装饰音候选）
+        short_class_mask:  (num_duration_classes,) bool，该类是否属于"短音类别"
+        valid_mask:        (batch, seq_len) bool，有效事件位（剔除 EOS 等特殊位）
+    """
+    num_real = int(short_class_mask.shape[0])
+    short_class_mask = short_class_mask.to(device=duration_logits.device, dtype=torch.float32)
+    probs = torch.softmax(duration_logits[..., :num_real].float(), dim=-1)   # (B, L, C)
+    pred_short = probs @ short_class_mask                                    # (B, L)
+
+    if valid_mask is None:
+        valid_mask = torch.ones_like(target_short_mask, dtype=torch.bool)
+    valid_mask = valid_mask.bool()
+    tgt = target_short_mask.to(pred_short.dtype)
+    if valid_mask.any():
+        return F.mse_loss(pred_short[valid_mask], tgt[valid_mask])
+    return F.mse_loss(pred_short, tgt)

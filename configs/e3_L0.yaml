@@ -1,0 +1,72 @@
+# E3 损失消融 L0：基线（仅三路事件 CE，无任何分布损失）
+# ==========================================================
+#
+# 本文件是**覆盖层**：未声明字段一律回退 configs/e1_compound_events.yaml。
+# 与 E2（configs/e2_compound_window.yaml）的差异：
+#   - 窗口切分、训练超参、掩码规则逐位继承 E2（控制变量，不得改动）；
+#   - 模型不再包含 features_head / style_head（models.py E3 起默认停用）；
+#   - 四项分布损失权重全 0 → 与 E2 损失口径一致。
+#
+# 用法（三种子）：
+#   venv/Scripts/python.exe train_boyatcn.py --mode compound --config configs/e3_L0.yaml --seed 2026
+#
+# 早停/最优判定监控量：验证集三路加权 CE（与 E2 可比）。
+
+experiment:
+  name: E3_L0_baseline
+  branch: experiment/E3_loss_ablation
+  seed: 2026
+  note: "L0 基线：total = 1.0*pitch_CE + 0.7*duration_CE + 0.7*shift_CE，无音级/调式/时值/IOI 分布损失"
+
+# ---- 窗口切分（严格继承 E2，禁止改动）----
+window:
+  window_size_events: 256
+  train_stride_events: 128
+  eval_stride_events: 256
+  drop_tail: true
+
+# ---- 训练超参（严格继承 E2）----
+training:
+  num_epochs: 200
+  batch_size: 16
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  lr_step_size: 50
+  lr_gamma: 0.5
+  early_stop_patience: 20
+  shuffle: true
+  num_workers: 0
+  loss_weight_pitch: 1.0
+  loss_weight_duration: 0.7
+  loss_weight_shift: 0.7
+  # ---- E3 分布损失权重（L0 全 0）----
+  loss_weight_pitch_class: 0.0     # 音级(pitch-class)分布 KL
+  loss_weight_mode: 0.0            # 调式(mode)符合度 KL
+  loss_weight_duration_dist: 0.0   # 时值分布 KL
+  loss_weight_ioi_dist: 0.0        # IOI(time-shift)分布 KL
+  loss_weight_ornament: 0.0        # 装饰音密度（L5 框架，本组不启用）
+  checkpoint_dir: checkpoints/e3/L0_seed{seed}
+  best_ckpt_name: best_valloss_model.pt
+  periodic_ckpt_every: 0
+  vocab_log_every_epochs: 10
+  long_tail_threshold: 5
+  top_k_classes: 10
+
+# ---- 分布损失的分箱配置（L0 不启用，但保留以固定真源，保证各组 bin 一致）----
+distribution:
+  # duration 类别 → 秒级直方图（左闭右开，最后一箱含上界；单位秒）
+  duration_bin_edges: [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 8.01]
+  # time-shift(IOI) 类别 → 秒级直方图
+  shift_ioi_bin_edges: [0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0, 8.0, 20.01]
+  # L5 装饰音框架：短音阈值（秒）
+  ornament_short_duration_sec: 0.15
+
+# ---- 产物路径（{seed} 由训练脚本替换）----
+outputs:
+  log_file: results/e3/L0_seed{seed}_train.log
+  csv_file: results/e3/L0_seed{seed}_train_log.csv
+  window_stats_csv: results/e3/e3_window_stats.csv
+  vocab_stats_json: results/e3/e3_vocab_stats.json
+  window_test_json: results/e2_window_slice_test.json
+  loss_curve_png: reports/e3/L0_seed{seed}_loss_curve.png

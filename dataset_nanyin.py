@@ -577,11 +577,29 @@ def slice_event_windows(
     return [(s, s + window_size) for s in range(0, num_events - window_size + 1, stride)]
 
 
+def resolve_window_mode_index(
+    pitch_ids,
+    song_mode_index: Optional[int] = None,
+) -> int:
+    """E3：窗口级调式索引（0..3，见 MODE_TO_INDEX）。
+
+    判定顺序：窗口自身音级直方图匹配（estimate_mode_from_pitch）
+    → 匹配度不足时回退曲目级调式 → 仍不可判定则回退 0（五空管）。
+    """
+    window_mode = estimate_mode_from_pitch(list(pitch_ids))
+    if window_mode is not None:
+        return int(MODE_TO_INDEX.get(window_mode, 0))
+    if song_mode_index is not None:
+        return int(song_mode_index)
+    return 0
+
+
 def build_window_sample(
     song_events: Dict[str, Any],
     start: int,
     end: int,
     codec: Optional[CompoundEventCodec] = None,
+    song_mode_index: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """由整曲事件序列切出一个窗口样本（含 BOS / EOS、attention_mask、ignore_index 掩码）。
 
@@ -596,8 +614,14 @@ def build_window_sample(
         song_events: encode_song_events() 的返回
         start/end:   窗口在整曲事件序列上的 [start, end) 区间
         codec:       编解码器
+        song_mode_index:
+            E3 新增：所属曲目的调式索引（0..3，见 MODE_TO_INDEX），
+            作为"窗口自身音级直方图不足以判定调式"时的回退值；None 时回退 0（五空管）。
     返回:
-        样本字典（全部为 torch.long 张量）
+        样本字典（全部为 torch.long 张量）。
+        E3 新增字段 ``target_mode_index``：窗口级调式真值（标量 long），
+        由窗口内真实音高的 pitch-class 直方图与南音四调五声音级集合匹配得到
+        （estimate_mode_from_pitch），匹配度不足时回退曲目级调式。
     """
     codec = codec if codec is not None else get_compound_codec()
 
@@ -626,6 +650,11 @@ def build_window_sample(
 
     attention_mask = torch.ones(seq_len, dtype=torch.long)
 
+    # ---- E3：窗口级调式真值（供 mode 分布损失使用）----
+    target_mode_index = torch.tensor(
+        resolve_window_mode_index(pitch_ids, song_mode_index), dtype=torch.long
+    )
+
     return {
         "input_pitch_ids": input_pitch_ids,
         "input_duration_ids": input_duration_ids,
@@ -634,6 +663,7 @@ def build_window_sample(
         "target_duration_ids": target_duration_ids,
         "target_shift_ids": target_shift_ids,
         "attention_mask": attention_mask,
+        "target_mode_index": target_mode_index,
     }
 
 
@@ -690,6 +720,9 @@ class CompoundEventWindowDataset(Dataset):
         self.records: List[Dict[str, Any]] = []
         self._song_events: Dict[str, Dict[str, Any]] = {}
         self._song_stats_rows: List[Dict[str, Any]] = []
+        # E3：曲目级调式索引（窗口自身无法判定时的回退值）+ 窗口级调式分布计数
+        self._song_mode_index: Dict[str, int] = {}
+        self._mode_index_counts: List[int] = [0, 0, 0, 0]
 
         for song_id in self.song_ids:
             song_events = encode_song_events(song_id, self.base_dir, self.codec)
@@ -698,18 +731,28 @@ class CompoundEventWindowDataset(Dataset):
                 continue
             self._song_events[song_id] = song_events
 
+            song_mode = estimate_mode_from_pitch(song_events["pitch_ids"])
+            self._song_mode_index[song_id] = (
+                int(MODE_TO_INDEX.get(song_mode, 0)) if song_mode is not None else 0
+            )
+
             num_events = int(song_events["num_events"])
             starts = slice_event_windows(num_events, self.window_size, self.stride)
             covered_tail = starts[-1][1] if starts else 0
             discarded_tail = num_events - covered_tail      # 未被任何窗口覆盖的尾部事件数
 
             for w_idx, (s, e) in enumerate(starts):
+                mode_idx = resolve_window_mode_index(
+                    song_events["pitch_ids"][s:e], self._song_mode_index[song_id]
+                )
+                self._mode_index_counts[mode_idx] += 1
                 self.records.append({
                     "song_id": song_id,
                     "split": self.split,
                     "start": int(s),
                     "end": int(e),
                     "window_index": int(w_idx),
+                    "mode_index": int(mode_idx),
                 })
 
             encode_stats = song_events["stats"]
@@ -737,7 +780,8 @@ class CompoundEventWindowDataset(Dataset):
         rec = self.records[idx]
         song_events = self._song_events[rec["song_id"]]
         sample = build_window_sample(
-            song_events, rec["start"], rec["end"], codec=self.codec
+            song_events, rec["start"], rec["end"], codec=self.codec,
+            song_mode_index=self._song_mode_index.get(rec["song_id"], 0),
         )
         sample.update({
             "song_id": rec["song_id"],
@@ -757,6 +801,10 @@ class CompoundEventWindowDataset(Dataset):
     def truncated_songs(self) -> List[Dict[str, Any]]:
         """被 codec.max_notes 截断的曲目清单（E2 硬性要求：必须如实打印记录）。"""
         return [r for r in self._song_stats_rows if r["truncated_notes"] > 0]
+
+    def mode_index_counts(self) -> List[int]:
+        """E3：窗口级调式真值分布计数（顺序 = NANYIN_FOUR_MODES）。"""
+        return list(self._mode_index_counts)
 
     def window_size_events(self) -> int:
         return self.window_size
@@ -812,6 +860,7 @@ def collate_compound_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "input_pitch_ids", "input_duration_ids", "input_shift_ids",
         "target_pitch_ids", "target_duration_ids", "target_shift_ids",
         "attention_mask",
+        "target_mode_index",     # E3：窗口级调式真值（标量 → stack 成 (B,)）
     ]
     meta_keys = ["song_id", "split", "start", "end", "window_index"]
     collated: Dict[str, Any] = {}

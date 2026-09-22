@@ -1,0 +1,66 @@
+# E3 损失消融 L5：L4 + 装饰相关损失 —— **仅代码框架，不执行训练**
+# ==========================================================
+#
+# ⚠ 状态说明（务必先读）：
+#   装饰音真值目前**没有可靠的人工标注**。现有装饰音标签来自
+#   dataset_nanyin.build_target_dict 的"短音 + 邻音跳进"启发式（由 BasicPitch
+#   AMT 转录派生），其可靠性未经人工核验。按实验规程，L5 只有在完成小规模人工
+#   核验后才能作为正式结果。因此本配置**不参与本套正式消融实验**：
+#     - 代码框架已实现（loss_nanyin.ornament_density_distribution_loss，
+#       作用于 duration_head logits）；
+#     - 梯度单元测试覆盖（tests/test_loss_gradient.py 第 5 项）；
+#     - 但**不执行本配置的训练**，L5 不出现在正式消融结果表与结论中。
+#
+# 若日后完成人工核验，启用方式：
+#   venv/Scripts/python.exe train_boyatcn.py --mode compound --config configs/e3_L5.yaml --seed 2026
+
+experiment:
+  name: E3_L5_ornament_FRAMEWORK_ONLY
+  branch: experiment/E3_loss_ablation
+  seed: 2026
+  note: "L5 = L4 + 1.0*装饰音密度损失（duration_head 短音概率质量 vs GT 短音比例）；仅框架，不训练、不纳入正式结果"
+
+window:
+  window_size_events: 256
+  train_stride_events: 128
+  eval_stride_events: 256
+  drop_tail: true
+
+training:
+  num_epochs: 200
+  batch_size: 16
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  lr_step_size: 50
+  lr_gamma: 0.5
+  early_stop_patience: 20
+  shuffle: true
+  num_workers: 0
+  loss_weight_pitch: 1.0
+  loss_weight_duration: 0.7
+  loss_weight_shift: 0.7
+  loss_weight_pitch_class: 1.0
+  loss_weight_mode: 1.0
+  loss_weight_duration_dist: 1.0
+  loss_weight_ioi_dist: 1.0
+  loss_weight_ornament: 1.0        # L5 新增（启发式真值，未人工核验 → 不执行训练）
+  checkpoint_dir: checkpoints/e3/L5_seed{seed}
+  best_ckpt_name: best_valloss_model.pt
+  periodic_ckpt_every: 0
+  vocab_log_every_epochs: 10
+  long_tail_threshold: 5
+  top_k_classes: 10
+
+distribution:
+  duration_bin_edges: [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 8.01]
+  shift_ioi_bin_edges: [0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0, 8.0, 20.01]
+  ornament_short_duration_sec: 0.15   # 短音阈值（秒）：duration <= 0.15s 视为装饰音候选
+
+outputs:
+  log_file: results/e3/L5_seed{seed}_train.log
+  csv_file: results/e3/L5_seed{seed}_train_log.csv
+  window_stats_csv: results/e3/e3_window_stats.csv
+  vocab_stats_json: results/e3/e3_vocab_stats.json
+  window_test_json: results/e2_window_slice_test.json
+  loss_curve_png: reports/e3/L5_seed{seed}_loss_curve.png

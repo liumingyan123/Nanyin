@@ -384,6 +384,8 @@ class NanyinBoYaTCN(nn.Module):
         pitch_vocab_size: int | None = None,
         duration_vocab_size: int | None = None,
         shift_vocab_size: int | None = None,
+        use_features_head: bool = False,
+        use_style_head: bool = False,
     ):
         """
         参数:
@@ -396,6 +398,12 @@ class NanyinBoYaTCN(nn.Module):
             style_dim:       风格嵌入维度
             max_seq_len:     最大序列长度
             dropout:         Dropout概率
+            use_features_head / use_style_head:
+                E3 起**默认关闭**这两个独立辅助头（MFCC 特征回归头 / 随机投影风格头）。
+                原因：E3 要求所有南音分布约束损失必须基于模型**最终生成输出**
+                （pitch_head / duration_head / shift_head 的 logits）计算，
+                不再经由与生成无关的独立辅助头间接约束；关闭后这两个头不再参与前向，
+                forward 返回字典中对应字段为 None。
             pitch_vocab_size / duration_vocab_size / shift_vocab_size:
                 E1 复合事件三路属性词表大小（**含 BOS/EOS 特殊 token**）；
                 None 时从 configs/e1_compound_events.yaml 读取（真实类别数 + num_special_tokens）
@@ -488,8 +496,10 @@ class NanyinBoYaTCN(nn.Module):
         # 全局级输出头（序列均值池化后）
         self.tempo_head = nn.Linear(d_model, num_tempo_bins)    # 速度分布
         self.mode_head = nn.Linear(d_model, num_modes)           # 调式logits
-        self.features_head = nn.Linear(d_model, feat_dim)        # MFCC特征
-        self.style_head = nn.Linear(d_model, style_dim)          # 风格嵌入
+        # E3：features_head（MFCC 回归）/ style_head（随机投影风格嵌入）为独立辅助头，
+        # 与最终生成输出无关，默认停用（use_*_head=False 时不创建、不参与前向、无参数）。
+        self.features_head = nn.Linear(d_model, feat_dim) if use_features_head else None
+        self.style_head = nn.Linear(d_model, style_dim) if use_style_head else None
 
     def _embed_input(
         self,
@@ -586,8 +596,12 @@ class NanyinBoYaTCN(nn.Module):
         x_global = x.mean(dim=1)                           # (B, d_model)
         pred_tempo_dist = self.tempo_head(x_global)         # (B, num_tempo_bins)
         pred_mode_logits = self.mode_head(x_global)         # (B, 4)
-        pred_features = self.features_head(x_global)        # (B, feat_dim)
-        pred_style = F.normalize(self.style_head(x_global), p=2, dim=-1)  # L2归一化
+        # E3：两个独立辅助头默认停用 → 输出 None（调用方需做 None 判断）
+        pred_features = self.features_head(x_global) if self.features_head is not None else None
+        pred_style = (
+            F.normalize(self.style_head(x_global), p=2, dim=-1)
+            if self.style_head is not None else None
+        )
 
         return {
             "pred_tokens":      pred_tokens,
@@ -654,6 +668,8 @@ class NanyinMusicMamba(nn.Module):
         pitch_vocab_size: int | None = None,
         duration_vocab_size: int | None = None,
         shift_vocab_size: int | None = None,
+        use_features_head: bool = False,
+        use_style_head: bool = False,
     ):
         """
         参数:
@@ -670,6 +686,8 @@ class NanyinMusicMamba(nn.Module):
             dropout:         Dropout概率
             pitch_vocab_size / duration_vocab_size / shift_vocab_size:
                 E1 复合事件三路属性词表大小；None 时从 configs/e1_compound_events.yaml 读取
+            use_features_head / use_style_head:
+                E3 起默认关闭这两个独立辅助头（同 NanyinBoYaTCN，详见其文档注释）
         """
         super().__init__()
         self.vocab_size = vocab_size
@@ -734,8 +752,10 @@ class NanyinMusicMamba(nn.Module):
         # 全局级输出头（序列均值池化后）
         self.tempo_head = nn.Linear(d_model, num_tempo_bins)    # 速度分布
         self.mode_head = nn.Linear(d_model, num_modes)           # 调式logits
-        self.features_head = nn.Linear(d_model, feat_dim)        # MFCC特征
-        self.style_head = nn.Linear(d_model, style_dim)          # 风格嵌入
+        # E3：features_head（MFCC 回归）/ style_head（随机投影风格嵌入）为独立辅助头，
+        # 与最终生成输出无关，默认停用（use_*_head=False 时不创建、不参与前向、无参数）。
+        self.features_head = nn.Linear(d_model, feat_dim) if use_features_head else None
+        self.style_head = nn.Linear(d_model, style_dim) if use_style_head else None
 
     def _embed_input(
         self,
@@ -805,8 +825,12 @@ class NanyinMusicMamba(nn.Module):
         x_global = x.mean(dim=1)                           # (B, d_model)
         pred_tempo_dist = self.tempo_head(x_global)         # (B, num_tempo_bins)
         pred_mode_logits = self.mode_head(x_global)         # (B, 4)
-        pred_features = self.features_head(x_global)        # (B, feat_dim)
-        pred_style = F.normalize(self.style_head(x_global), p=2, dim=-1)  # L2归一化
+        # E3：两个独立辅助头默认停用 → 输出 None（调用方需做 None 判断）
+        pred_features = self.features_head(x_global) if self.features_head is not None else None
+        pred_style = (
+            F.normalize(self.style_head(x_global), p=2, dim=-1)
+            if self.style_head is not None else None
+        )
 
         return {
             "pred_tokens":      pred_tokens,

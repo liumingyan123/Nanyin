@@ -1,0 +1,62 @@
+# E3 损失消融 L3：基础 + 时值分布 + IOI 分布损失
+# ==========================================================
+#
+# 覆盖层；未声明字段回退 configs/e1_compound_events.yaml。
+# 与 L0 的差异：新增 loss_weight_duration_dist = 1.0、loss_weight_ioi_dist = 1.0。
+# 两项损失分别作用于 **duration_head / shift_head logits**：
+#   时值：402 个 duration 类别按秒级直方图 bin 聚合（缓解 404 细档长尾稀疏）
+#   IOI ：1002 个 shift 类别按 IOI 秒级直方图 bin 聚合（末尾伪标签位继续掩码）
+#
+# 用法：
+#   venv/Scripts/python.exe train_boyatcn.py --mode compound --config configs/e3_L3.yaml --seed 2026
+
+experiment:
+  name: E3_L3_duration_ioi
+  branch: experiment/E3_loss_ablation
+  seed: 2026
+  note: "L3 = L0 + 1.0*时值分布KL(duration_head) + 1.0*IOI分布KL(shift_head)"
+
+window:
+  window_size_events: 256
+  train_stride_events: 128
+  eval_stride_events: 256
+  drop_tail: true
+
+training:
+  num_epochs: 200
+  batch_size: 16
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  lr_step_size: 50
+  lr_gamma: 0.5
+  early_stop_patience: 20
+  shuffle: true
+  num_workers: 0
+  loss_weight_pitch: 1.0
+  loss_weight_duration: 0.7
+  loss_weight_shift: 0.7
+  loss_weight_pitch_class: 0.0
+  loss_weight_mode: 0.0
+  loss_weight_duration_dist: 1.0
+  loss_weight_ioi_dist: 1.0
+  loss_weight_ornament: 0.0
+  checkpoint_dir: checkpoints/e3/L3_seed{seed}
+  best_ckpt_name: best_valloss_model.pt
+  periodic_ckpt_every: 0
+  vocab_log_every_epochs: 10
+  long_tail_threshold: 5
+  top_k_classes: 10
+
+distribution:
+  duration_bin_edges: [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 8.01]
+  shift_ioi_bin_edges: [0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0, 8.0, 20.01]
+  ornament_short_duration_sec: 0.15
+
+outputs:
+  log_file: results/e3/L3_seed{seed}_train.log
+  csv_file: results/e3/L3_seed{seed}_train_log.csv
+  window_stats_csv: results/e3/e3_window_stats.csv
+  vocab_stats_json: results/e3/e3_vocab_stats.json
+  window_test_json: results/e2_window_slice_test.json
+  loss_curve_png: reports/e3/L3_seed{seed}_loss_curve.png

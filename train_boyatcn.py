@@ -65,6 +65,14 @@ from loss_nanyin import (
     fad_diff,
     style_cosine_loss,
     NANYIN_FOUR_MODES,
+    # ---- E3：可微分布损失（全部基于生成头 logits）----
+    build_pitch_class_matrix,
+    build_value_bin_matrix,
+    build_mode_distribution_matrix,
+    pitch_class_distribution_loss,
+    mode_distribution_loss,
+    duration_distribution_loss,
+    shift_ioi_distribution_loss,
 )
 from dataset_nanyin import (
     IGNORE_INDEX,
@@ -147,10 +155,13 @@ def compute_component_losses(preds: dict, target_dict: dict) -> Dict[str, float]
     m_kl = mode_kl(preds["pred_mode_logits"], target_dict["target_mode_dist"]).item()
     mode_loss = m_kl
 
-    # 风格损失
-    f_val = fad_diff(preds["pred_features"], target_dict["target_features"]).item()
-    s_cos = style_cosine_loss(preds["pred_style"], target_dict["target_style"]).item()
-    style_loss = f_val + s_cos
+    # 风格损失（E3：两个独立辅助头默认停用 → 前向返回 None，此时风格损失记 0）
+    if preds.get("pred_features") is None or preds.get("pred_style") is None:
+        style_loss = 0.0
+    else:
+        f_val = fad_diff(preds["pred_features"], target_dict["target_features"]).item()
+        s_cos = style_cosine_loss(preds["pred_style"], target_dict["target_style"]).item()
+        style_loss = f_val + s_cos
 
     return {
         "ce": ce_loss,
@@ -346,11 +357,14 @@ def validate_noef(
         m_kl = mode_kl(preds["pred_mode_logits"], target_on_device["target_mode_dist"]).item()
         total_mode_kl += m_kl * batch_size
 
-        # 风格
-        f_val = fad_diff(preds["pred_features"], target_on_device["target_features"]).item()
-        s_cos = style_cosine_loss(preds["pred_style"], target_on_device["target_style"]).item()
-        total_fad += f_val * batch_size
-        total_style_cos += s_cos * batch_size
+        # 风格（E3：两个独立辅助头默认停用 → 前向返回 None，此时跳过统计）
+        if preds.get("pred_features") is None or preds.get("pred_style") is None:
+            pass
+        else:
+            f_val = fad_diff(preds["pred_features"], target_on_device["target_features"]).item()
+            s_cos = style_cosine_loss(preds["pred_style"], target_on_device["target_style"]).item()
+            total_fad += f_val * batch_size
+            total_style_cos += s_cos * batch_size
 
     # ---- 平均化 ----
     n = max(total_samples, 1)
@@ -860,19 +874,66 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def build_distribution_matrices(codec, cfg: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    """E3：构造四种分布损失的常量聚合矩阵（不参与梯度）。
+
+    矩阵由 codec 的物理量映射（index_to_duration / index_to_shift）与配置的
+    直方图分箱边界算出：
+      pc       (pitch_vocab_size, 12)  MIDI 音高 → 音级
+      mode     (4, 12)                 南音四调五声音级先验分布
+      duration (duration_num_classes, K_d)  duration 类别 → 秒级直方图 bin
+      shift    (shift_num_classes, K_s)     shift 类别 → IOI 秒级直方图 bin
+    """
+    dcfg = cfg.get("distribution", {})
+    if not dcfg:
+        raise KeyError("[train_boyatcn] 配置缺少 distribution 小节（E3 损失需要分箱边界）")
+    # L5 装饰音框架：短音类别掩码（duration 秒值 <= 阈值 → 装饰音候选）
+    short_thr = float(dcfg.get("ornament_short_duration_sec", 0.15))
+    short_mask = torch.tensor(
+        [codec.index_to_duration(i) <= short_thr for i in range(int(codec.duration_num_classes))],
+        dtype=torch.bool,
+    )
+    return {
+        "duration_short": short_mask,
+        "ornament_short_sec": short_thr,
+        "pc": build_pitch_class_matrix(int(codec.pitch_vocab_size)),
+        "mode": build_mode_distribution_matrix(),
+        "duration": build_value_bin_matrix(
+            [codec.index_to_duration(i) for i in range(int(codec.duration_num_classes))],
+            dcfg["duration_bin_edges"],
+        ),
+        "shift": build_value_bin_matrix(
+            [codec.index_to_shift(i) for i in range(int(codec.shift_num_classes))],
+            dcfg["shift_ioi_bin_edges"],
+        ),
+    }
+
+
 def compute_compound_loss(
     pred: Dict[str, torch.Tensor],
     tgt: Dict[str, torch.Tensor],
     w_pitch: float,
     w_duration: float,
     w_shift: float,
+    w_pc: float = 0.0,
+    w_mode: float = 0.0,
+    w_dur_dist: float = 0.0,
+    w_ioi_dist: float = 0.0,
+    w_ornament: float = 0.0,
+    matrices: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """E2 三路分类 CE。
+    """E2 三路分类 CE（+ E3 可选分布损失）。
 
         total = w_pitch * pitch_CE + w_duration * duration_CE + w_shift * shift_CE
+              + w_pc       * 音级分布KL      （L1，基于 pitch_head logits）
+              + w_mode     * 调式分布KL      （L2，基于 pitch_head logits）
+              + w_dur_dist * 时值分布KL      （L3，基于 duration_head logits）
+              + w_ioi_dist * IOI分布KL       （L3，基于 shift_head logits）
 
     shift_CE 使用 ignore_index=IGNORE_INDEX：窗口最后一个事件位（伪标签）与 EOS 位
-    不参与损失，也不参与反向传播。
+    不参与损失，也不参与反向传播。分布损失同样剔除这些位置（以及 BOS/EOS 特殊 token）。
+
+    权重为 0 时对应分布损失**完全不计算**（与 E2 口径逐位一致）。
     """
     pitch_ce = F.cross_entropy(
         pred["pred_pitch_logits"].reshape(-1, pred["pred_pitch_logits"].shape[-1]),
@@ -888,12 +949,64 @@ def compute_compound_loss(
         ignore_index=IGNORE_INDEX,
     )
     total = w_pitch * pitch_ce + w_duration * duration_ce + w_shift * shift_ce
-    return total, {
+
+    info: Dict[str, float] = {
         "pitch_ce": float(pitch_ce.detach()),
         "duration_ce": float(duration_ce.detach()),
         "shift_ce": float(shift_ce.detach()),
-        "total": float(total.detach()),
+        "pc_kl": 0.0, "mode_kl": 0.0, "dur_dist_kl": 0.0, "ioi_dist_kl": 0.0,
+        "ornament_kl": 0.0,
+        # 与 E2 可比口径：只含三路加权 CE（不含分布损失），用于跨组对照与早停判定
+        "ce_total": float((w_pitch * pitch_ce + w_duration * duration_ce + w_shift * shift_ce).detach()),
     }
+
+    if matrices is not None and (w_pc or w_mode or w_dur_dist or w_ioi_dist or w_ornament):
+        # 音级/调式：剔除 BOS/EOS 等特殊 token 位（pitch id >= 128）
+        pitch_valid = tgt["target_pitch_ids"] < matrices["pc"].shape[0]
+        if w_pc:
+            pc_kl = pitch_class_distribution_loss(
+                pred["pred_pitch_logits"], tgt["target_pitch_ids"],
+                pc_matrix=matrices["pc"], valid_mask=pitch_valid,
+            )
+            total = total + w_pc * pc_kl
+            info["pc_kl"] = float(pc_kl.detach())
+        if w_mode:
+            mode_kl_v = mode_distribution_loss(
+                pred["pred_pitch_logits"], tgt["target_mode_index"],
+                pc_matrix=matrices["pc"], mode_dist_matrix=matrices["mode"],
+                valid_mask=pitch_valid,
+            )
+            total = total + w_mode * mode_kl_v
+            info["mode_kl"] = float(mode_kl_v.detach())
+        if w_dur_dist:
+            dur_kl = duration_distribution_loss(
+                pred["pred_duration_logits"], tgt["target_duration_ids"],
+                bin_matrix=matrices["duration"],
+            )
+            total = total + w_dur_dist * dur_kl
+            info["dur_dist_kl"] = float(dur_kl.detach())
+        if w_ioi_dist:
+            ioi_kl = shift_ioi_distribution_loss(
+                pred["pred_shift_logits"], tgt["target_shift_ids"],
+                bin_matrix=matrices["shift"],
+            )
+            total = total + w_ioi_dist * ioi_kl
+            info["ioi_dist_kl"] = float(ioi_kl.detach())
+        if w_ornament:
+            # L5 框架：GT 短音比例 vs duration_head 预测的短音概率质量
+            num_dur = int(matrices["duration_short"].shape[0])
+            dur_valid = tgt["target_duration_ids"] < num_dur
+            short_tgt = matrices["duration_short"].to(device=tgt["target_duration_ids"].device)
+            short_target = short_tgt[tgt["target_duration_ids"].clamp(min=0, max=num_dur - 1)]
+            orn_loss = ornament_density_distribution_loss(
+                pred["pred_duration_logits"], short_target,
+                short_class_mask=matrices["duration_short"], valid_mask=dur_valid,
+            )
+            total = total + w_ornament * orn_loss
+            info["ornament_kl"] = float(orn_loss.detach())
+
+    info["total"] = float(total.detach())
+    return total, info
 
 
 @torch.no_grad()
@@ -904,10 +1017,18 @@ def evaluate_compound(
     w_pitch: float,
     w_duration: float,
     w_shift: float,
+    w_pc: float = 0.0,
+    w_mode: float = 0.0,
+    w_dur_dist: float = 0.0,
+    w_ioi_dist: float = 0.0,
+    w_ornament: float = 0.0,
+    matrices: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, float]:
-    """验证集评估：加权 total loss + 三路分项 CE + token 级准确率。"""
+    """验证集评估：加权 total loss + 三路分项 CE + 分布损失 + token 级准确率。"""
     model.eval()
-    acc = {"pitch_ce": 0.0, "duration_ce": 0.0, "shift_ce": 0.0, "total": 0.0}
+    acc = {"pitch_ce": 0.0, "duration_ce": 0.0, "shift_ce": 0.0, "total": 0.0,
+           "pc_kl": 0.0, "mode_kl": 0.0, "dur_dist_kl": 0.0, "ioi_dist_kl": 0.0,
+           "ornament_kl": 0.0, "ce_total": 0.0}
     correct = {"pitch": 0, "duration": 0, "shift": 0}
     n_tok = {"pitch": 0, "duration": 0, "shift": 0}
     num_batches = 0
@@ -917,13 +1038,18 @@ def evaluate_compound(
             "target_pitch_ids": batch["target_pitch_ids"].to(device),
             "target_duration_ids": batch["target_duration_ids"].to(device),
             "target_shift_ids": batch["target_shift_ids"].to(device),
+            "target_mode_index": batch["target_mode_index"].to(device),
         }
         pred = model(
             batch["input_pitch_ids"].to(device),
             batch["input_duration_ids"].to(device),
             batch["input_shift_ids"].to(device),
         )
-        _, info = compute_compound_loss(pred, tgt, w_pitch, w_duration, w_shift)
+        _, info = compute_compound_loss(
+            pred, tgt, w_pitch, w_duration, w_shift,
+            w_pc=w_pc, w_mode=w_mode, w_dur_dist=w_dur_dist, w_ioi_dist=w_ioi_dist,
+            w_ornament=w_ornament, matrices=matrices,
+        )
         for k in acc:
             acc[k] += info[k]
         num_batches += 1
@@ -976,9 +1102,15 @@ def train_compound(
     seed: Optional[int] = None,
     checkpoint_dir: Optional[str] = None,
     patience: Optional[int] = None,
+    config_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """E2：复合事件窗口训练主流程（加权三路 CE + 早停 best-val）。"""
-    cfg = load_config(E2_CONFIG_PATH)
+    """E2/E3 复合事件窗口训练主流程（加权三路 CE + 可选分布损失 + 早停 best-val）。
+
+    参数:
+        config_path: E3 新增。覆盖层 YAML 路径（如 configs/e3_L2.yaml）；
+                     None 时沿用 E2 配置 configs/e2_compound_window.yaml（纯三路 CE）。
+    """
+    cfg = load_config(config_path if config_path is not None else E2_CONFIG_PATH)
     tcfg = cfg["training"]
     outcfg = cfg["outputs"]
 
@@ -987,33 +1119,54 @@ def train_compound(
     learning_rate = float(learning_rate if learning_rate is not None else tcfg["learning_rate"])
     seed = int(seed if seed is not None else cfg["experiment"]["seed"])
     patience = int(patience if patience is not None else tcfg["early_stop_patience"])
-    checkpoint_dir = checkpoint_dir if checkpoint_dir is not None else tcfg["checkpoint_dir"]
+
+    def _fmt(p: Optional[str]) -> Optional[str]:
+        """路径模板：把 {seed} 替换为当前随机种子（E3 多籽实验用）。"""
+        return p.replace("{seed}", str(seed)) if isinstance(p, str) else p
+
+    checkpoint_dir = _fmt(checkpoint_dir if checkpoint_dir is not None else tcfg["checkpoint_dir"])
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     w_pitch = float(tcfg["loss_weight_pitch"])
     w_duration = float(tcfg["loss_weight_duration"])
     w_shift = float(tcfg["loss_weight_shift"])
+    # ---- E3：四项分布损失权重（0 = 不启用；E2 配置无这些键 → 默认 0，口径不变）----
+    w_pc = float(tcfg.get("loss_weight_pitch_class", 0.0))
+    w_mode = float(tcfg.get("loss_weight_mode", 0.0))
+    w_dur_dist = float(tcfg.get("loss_weight_duration_dist", 0.0))
+    w_ioi_dist = float(tcfg.get("loss_weight_ioi_dist", 0.0))
+    w_ornament = float(tcfg.get("loss_weight_ornament", 0.0))     # L5 框架（默认 0）
     vocab_every = int(tcfg["vocab_log_every_epochs"])
     top_k = int(tcfg["top_k_classes"])
 
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    log_path = outcfg["log_file"]
-    csv_path = outcfg["csv_file"]
+    log_path = _fmt(outcfg["log_file"])
+    csv_path = _fmt(outcfg["csv_file"])
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     log_lines: List[str] = []
     fh = open(log_path, "w", encoding="utf-8")
 
+    stage = cfg["experiment"].get("name", "E2_compound_window")
     _e2_log(log_lines, "=" * 74, fh)
-    _e2_log(log_lines, f"E2 复合事件窗口训练 — BoYaTCN（分支 {cfg['experiment']['branch']}）", fh)
+    _e2_log(log_lines, f"{stage} — 复合事件窗口训练 BoYaTCN（分支 {cfg['experiment']['branch']}，"
+                       f"配置 {config_path or E2_CONFIG_PATH}）", fh)
     _e2_log(log_lines, "=" * 74, fh)
     _e2_log(log_lines, f"设备={device}, seed={seed}, epochs={num_epochs}, batch_size={batch_size}, "
                        f"lr={learning_rate}, weight_decay={tcfg['weight_decay']}, "
                        f"early_stop_patience={patience}", fh)
     _e2_log(log_lines, f"损失: total = {w_pitch}*pitch_CE + {w_duration}*duration_CE + {w_shift}*shift_CE"
                        f"（shift 使用 ignore_index={IGNORE_INDEX} 屏蔽窗口尾伪标签）", fh)
-    _e2_log(log_lines, "本阶段不做 L0-L5 损失消融（留给 E3）：无音级 / 调式 / IOI 额外损失。", fh)
+    if any((w_pc, w_mode, w_dur_dist, w_ioi_dist, w_ornament)):
+        _e2_log(log_lines,
+                f"      + {w_pc}*音级分布KL + {w_mode}*调式分布KL + {w_dur_dist}*时值分布KL"
+                f" + {w_ioi_dist}*IOI分布KL + {w_ornament}*装饰音密度损失"
+                f"（全部基于生成头 logits，见 loss_nanyin 第九节）", fh)
+    else:
+        _e2_log(log_lines, "      无分布损失（L0 基线口径：仅三路 CE）。", fh)
+    _e2_log(log_lines, "早停/最优判定监控量 = 验证集三路加权 CE（与 E2 口径一致，跨组可比）；"
+                       "分布损失只参与优化，不参与最优判定。", fh)
 
     # ---------------- 数据 ----------------
     codec = get_compound_codec(cfg)
@@ -1021,7 +1174,23 @@ def train_compound(
                        f"pitch={codec.pitch_vocab_total}/duration={codec.duration_vocab_total}"
                        f"/shift={codec.shift_vocab_total}（含BOS/EOS）, max_notes={codec.max_notes}", fh)
 
+    # ---- E3：分布损失聚合矩阵（常量，不参与梯度）----
+    use_dist = any((w_pc, w_mode, w_dur_dist, w_ioi_dist, w_ornament))
+    matrices = build_distribution_matrices(codec, cfg) if use_dist else None
+    if matrices is not None:
+        _e2_log(log_lines,
+                f"[分布损失] 聚合矩阵 pc={tuple(matrices['pc'].shape)}, "
+                f"mode={tuple(matrices['mode'].shape)}, duration={tuple(matrices['duration'].shape)}, "
+                f"shift={tuple(matrices['shift'].shape)}", fh)
+
     train_ds, val_ds = get_compound_window_datasets(cfg=cfg, verbose=False)
+
+    # ---- E3：如实记录窗口级调式真值分布（mode 损失的目标来源）----
+    tr_modes, va_modes = train_ds.mode_index_counts(), val_ds.mode_index_counts()
+    _e2_log(log_lines, f"[调式真值分布] 训练窗口 " + ", ".join(
+        f"{NANYIN_FOUR_MODES[i]}={tr_modes[i]}" for i in range(4)), fh)
+    _e2_log(log_lines, f"{'':>16}验证窗口 " + ", ".join(
+        f"{NANYIN_FOUR_MODES[i]}={va_modes[i]}" for i in range(4)), fh)
 
     _e2_log(log_lines, "\n[窗口统计] 训练集（滑动，步长128） + 验证集（非重叠，步长256）", fh)
     _e2_log(log_lines, f"  {'曲目':<28}{'划分':<7}{'事件数':>8}{'窗口数':>8}{'尾丢弃':>8}{'max_notes截断':>14}", fh)
@@ -1042,11 +1211,13 @@ def train_compound(
     else:
         _e2_log(log_lines, "  （无）", fh)
 
-    with open(outcfg["window_stats_csv"], "w", encoding="utf-8-sig", newline="") as f:
+    window_stats_csv = _fmt(outcfg["window_stats_csv"])
+    os.makedirs(os.path.dirname(window_stats_csv) or ".", exist_ok=True)
+    with open(window_stats_csv, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-    _e2_log(log_lines, f"  窗口统计清单已写入: {outcfg['window_stats_csv']}", fh)
+    _e2_log(log_lines, f"  窗口统计清单已写入: {window_stats_csv}", fh)
 
     # ---- 硬性要求：词表类别频次统计（长尾监控）----
     _e2_log(log_lines, "\n[词表类别频次统计] 训练集监督位置（shift 跳过伪标签位）：", fh)
@@ -1054,9 +1225,11 @@ def train_compound(
         train_ds, top_k=top_k, long_tail_threshold=int(tcfg["long_tail_threshold"])
     )
     _log_vocab_stats(vocab_stats, log_lines, fh, top_k=top_k)
-    with open(outcfg["vocab_stats_json"], "w", encoding="utf-8") as f:
+    vocab_stats_json = _fmt(outcfg["vocab_stats_json"])
+    os.makedirs(os.path.dirname(vocab_stats_json) or ".", exist_ok=True)
+    with open(vocab_stats_json, "w", encoding="utf-8") as f:
         json.dump(vocab_stats, f, ensure_ascii=False, indent=2)
-    _e2_log(log_lines, f"  词表统计明细已写入: {outcfg['vocab_stats_json']}", fh)
+    _e2_log(log_lines, f"  词表统计明细已写入: {vocab_stats_json}", fh)
 
     g = torch.Generator()
     g.manual_seed(seed)
@@ -1086,30 +1259,38 @@ def train_compound(
     best_val = float("inf")
     best_epoch = -1
     no_improve = 0
-    best_path = os.path.join(checkpoint_dir, tcfg["best_ckpt_name"])
+    best_path = os.path.join(checkpoint_dir, _fmt(tcfg["best_ckpt_name"]))
     periodic_every = int(tcfg.get("periodic_ckpt_every", 0))
     start_time = time.time()
 
     _e2_log(log_lines, "\n[训练开始]", fh)
     _e2_log(log_lines, f"{'epoch':>6}{'train_total':>13}{'pitch':>10}{'dur':>10}{'shift':>10}"
-                       f"{'val_total':>12}{'val_p':>9}{'val_d':>9}{'val_s':>9}{'lr':>10}{'备注':>8}", fh)
+                       f"{'val_total':>12}{'val_p':>9}{'val_d':>9}{'val_s':>9}"
+                       f"{'v_pc':>8}{'v_md':>8}{'v_du':>8}{'v_ioi':>8}{'lr':>10}{'备注':>8}", fh)
 
     for epoch in range(1, num_epochs + 1):
         model.train()
-        run = {"pitch_ce": 0.0, "duration_ce": 0.0, "shift_ce": 0.0, "total": 0.0}
+        run = {"pitch_ce": 0.0, "duration_ce": 0.0, "shift_ce": 0.0, "total": 0.0,
+               "pc_kl": 0.0, "mode_kl": 0.0, "dur_dist_kl": 0.0, "ioi_dist_kl": 0.0,
+               "ornament_kl": 0.0, "ce_total": 0.0}
         n_batches = 0
         for batch in train_loader:
             tgt = {
                 "target_pitch_ids": batch["target_pitch_ids"].to(device),
                 "target_duration_ids": batch["target_duration_ids"].to(device),
                 "target_shift_ids": batch["target_shift_ids"].to(device),
+                "target_mode_index": batch["target_mode_index"].to(device),
             }
             pred = model(
                 batch["input_pitch_ids"].to(device),
                 batch["input_duration_ids"].to(device),
                 batch["input_shift_ids"].to(device),
             )
-            loss, info = compute_compound_loss(pred, tgt, w_pitch, w_duration, w_shift)
+            loss, info = compute_compound_loss(
+                pred, tgt, w_pitch, w_duration, w_shift,
+                w_pc=w_pc, w_mode=w_mode, w_dur_dist=w_dur_dist, w_ioi_dist=w_ioi_dist,
+                w_ornament=w_ornament, matrices=matrices,
+            )
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(tcfg["grad_clip"]))
@@ -1120,13 +1301,18 @@ def train_compound(
 
         n_batches = max(n_batches, 1)
         train_avg = {k: v / n_batches for k, v in run.items()}
-        val = evaluate_compound(model, val_loader, device, w_pitch, w_duration, w_shift)
+        val = evaluate_compound(
+            model, val_loader, device, w_pitch, w_duration, w_shift,
+            w_pc=w_pc, w_mode=w_mode, w_dur_dist=w_dur_dist, w_ioi_dist=w_ioi_dist,
+            w_ornament=w_ornament, matrices=matrices,
+        )
         lr_now = optimizer.param_groups[0]["lr"]
 
+        # 最优/早停判定：三路加权 CE（跨组、与 E2 可比）；val["total"] 含分布损失仅作参考
         note = ""
-        is_best = val["total"] < best_val
+        is_best = val["ce_total"] < best_val
         if is_best:
-            best_val = val["total"]
+            best_val = val["ce_total"]
             best_epoch = epoch
             no_improve = 0
             torch.save({
@@ -1134,6 +1320,7 @@ def train_compound(
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": best_val,
+                "val_total_with_dist": val["total"],
                 "train_loss": train_avg["total"],
                 "config": cfg,
             }, best_path)
@@ -1145,7 +1332,9 @@ def train_compound(
                 f"{epoch:>6}{train_avg['total']:>13.4f}{train_avg['pitch_ce']:>10.4f}"
                 f"{train_avg['duration_ce']:>10.4f}{train_avg['shift_ce']:>10.4f}"
                 f"{val['total']:>12.4f}{val['pitch_ce']:>9.4f}{val['duration_ce']:>9.4f}"
-                f"{val['shift_ce']:>9.4f}{lr_now:>10.2e}{note:>8}", fh)
+                f"{val['shift_ce']:>9.4f}{val['pc_kl']:>8.4f}{val['mode_kl']:>8.4f}"
+                f"{val['dur_dist_kl']:>8.4f}{val['ioi_dist_kl']:>8.4f}"
+                f"{lr_now:>10.2e}{note:>8}", fh)
 
         history.append({
             "epoch": epoch,
@@ -1153,10 +1342,22 @@ def train_compound(
             "train_pitch_ce": train_avg["pitch_ce"],
             "train_duration_ce": train_avg["duration_ce"],
             "train_shift_ce": train_avg["shift_ce"],
+            "train_pc_kl": train_avg["pc_kl"],
+            "train_mode_kl": train_avg["mode_kl"],
+            "train_dur_dist_kl": train_avg["dur_dist_kl"],
+            "train_ioi_dist_kl": train_avg["ioi_dist_kl"],
+            "train_ornament_kl": train_avg["ornament_kl"],
+            "train_ce_total": train_avg["ce_total"],
             "val_total": val["total"],
             "val_pitch_ce": val["pitch_ce"],
             "val_duration_ce": val["duration_ce"],
             "val_shift_ce": val["shift_ce"],
+            "val_pc_kl": val["pc_kl"],
+            "val_mode_kl": val["mode_kl"],
+            "val_dur_dist_kl": val["dur_dist_kl"],
+            "val_ioi_dist_kl": val["ioi_dist_kl"],
+            "val_ornament_kl": val["ornament_kl"],
+            "val_ce_total": val["ce_total"],
             "val_pitch_acc": val["pitch_acc"],
             "val_duration_acc": val["duration_acc"],
             "val_shift_acc": val["shift_acc"],
@@ -1186,8 +1387,8 @@ def train_compound(
     elapsed = time.time() - start_time
     _e2_log(log_lines, "\n[训练结束]", fh)
     _e2_log(log_lines, f"  总轮数={len(history)}, 耗时={elapsed / 60:.1f} 分钟", fh)
-    _e2_log(log_lines, f"  最优验证 total loss={best_val:.4f} @ epoch {best_epoch}"
-                       f"（best-val checkpoint: {best_path}）", fh)
+    _e2_log(log_lines, f"  最优验证三路加权 CE={best_val:.4f} @ epoch {best_epoch}"
+                       f"（best-val checkpoint: {best_path}；该量为跨组/与 E2 可比口径）", fh)
     best_row = next((h for h in history if h["epoch"] == best_epoch), None)
     if best_row:
         _e2_log(log_lines, f"  该轮验证 token 准确率: pitch={best_row['val_pitch_acc'] * 100:.2f}%, "
@@ -1201,6 +1402,18 @@ def train_compound(
         writer.writerows(history)
     _e2_log(log_lines, f"  逐轮日志 CSV: {csv_path}", fh)
     _e2_log(log_lines, f"  完整训练日志: {log_path}", fh)
+
+    # ---- 训练结束绘制损失曲线（E3 硬性要求：每组一张 PNG）----
+    curve_png = _fmt(outcfg.get("loss_curve_png"))
+    if curve_png:
+        try:
+            import plot_loss_curve
+            os.makedirs(os.path.dirname(curve_png) or ".", exist_ok=True)
+            plot_loss_curve.plot(csv_path, curve_png,
+                                 title=f"{stage}（seed={seed}）训练/验证损失曲线")
+            _e2_log(log_lines, f"  损失曲线 PNG: {curve_png}", fh)
+        except Exception as exc:      # 作图失败不阻断训练结果
+            _e2_log(log_lines, f"  ⚠ 损失曲线作图失败: {exc}", fh)
     fh.close()
 
     return {
@@ -1213,6 +1426,9 @@ def train_compound(
         "elapsed_sec": elapsed,
         "vocab_stats": vocab_stats,
         "num_params": n_params,
+        "csv_path": csv_path,
+        "log_path": log_path,
+        "curve_png": curve_png,
     }
 
 
@@ -1232,6 +1448,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
+    parser.add_argument("--config", type=str, default=None,
+                        help="覆盖层 YAML 路径（E3 消融：configs/e3_L0.yaml ... e3_L4.yaml）；"
+                             "默认 configs/e2_compound_window.yaml")
     args = parser.parse_args()
 
     if hasattr(sys.stdout, "reconfigure"):           # type: ignore[attr-defined]
@@ -1245,6 +1464,7 @@ if __name__ == "__main__":
             seed=args.seed,
             checkpoint_dir=args.checkpoint_dir,
             patience=args.patience,
+            config_path=args.config,
         )
         print(f"\n完成：最优验证 total loss={result['best_val_loss']:.4f} "
               f"@ epoch {result['best_epoch']}；checkpoint: {result['best_ckpt']}")

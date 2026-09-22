@@ -120,10 +120,13 @@ def compute_component_losses(preds: dict, target_dict: dict) -> Dict[str, float]
     m_kl = mode_kl(preds["pred_mode_logits"], target_dict["target_mode_dist"]).item()
     mode_loss = m_kl
 
-    # 风格损失
-    f_val = fad_diff(preds["pred_features"], target_dict["target_features"]).item()
-    s_cos = style_cosine_loss(preds["pred_style"], target_dict["target_style"]).item()
-    style_loss = f_val + s_cos
+    # 风格损失（E3：两个独立辅助头默认停用 → 前向返回 None，此时风格损失记 0）
+    if preds.get("pred_features") is None or preds.get("pred_style") is None:
+        style_loss = 0.0
+    else:
+        f_val = fad_diff(preds["pred_features"], target_dict["target_features"]).item()
+        s_cos = style_cosine_loss(preds["pred_style"], target_dict["target_style"]).item()
+        style_loss = f_val + s_cos
 
     return {
         "ce": ce_loss,
@@ -321,11 +324,14 @@ def validate_noef(
         m_kl = mode_kl(preds["pred_mode_logits"], target_on_device["target_mode_dist"]).item()
         total_mode_kl += m_kl * batch_size
 
-        # 风格
-        f_val = fad_diff(preds["pred_features"], target_on_device["target_features"]).item()
-        s_cos = style_cosine_loss(preds["pred_style"], target_on_device["target_style"]).item()
-        total_fad += f_val * batch_size
-        total_style_cos += s_cos * batch_size
+        # 风格（E3：两个独立辅助头默认停用 → 前向返回 None，此时跳过统计）
+        if preds.get("pred_features") is None or preds.get("pred_style") is None:
+            pass
+        else:
+            f_val = fad_diff(preds["pred_features"], target_on_device["target_features"]).item()
+            s_cos = style_cosine_loss(preds["pred_style"], target_on_device["target_style"]).item()
+            total_fad += f_val * batch_size
+            total_style_cos += s_cos * batch_size
 
     # ---- 平均化 ----
     n = max(total_samples, 1)
