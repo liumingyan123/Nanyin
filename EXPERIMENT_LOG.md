@@ -645,3 +645,35 @@ mode_KL 稳定停在 0.16 附近（先验与真实音级分布存在不可消残
 **commit 记录**：`da8c9b2`（代码+配置+梯度测试脚本）→ `a00c2d2`（梯度测试日志）→ `a81edef`（L0）→ `7191866`（L1）→ `ebf9d23`（L2）→ `06e1d00`（L3）→ `20c6d8f`（L4+L5）。
 
 **下一步（留给 E4 及以后）**：① duration 词表粗化/对数分箱或改连续时长回归；② 扩大验证集（≥3~4 首）降低 best-val 方差；③ mode 先验改平滑分布；④ 若要继续用分布损失，先做权重量级搜索（1/5/10）。
+
+## 7. E4：固定权重 + temperature / top-p 采样超参网格搜索（分支 `experiment/E4_sampling_search`）
+
+### 7.0 前置背景与约束（写入 E4 全部产物头部）
+
+- **E4 不做任何训练**。模型权重全部固定取自 **E3-L3 三组随机种子（2026/2027/2028）的 best-val 早停 checkpoint**
+  （早停口径 = 验证集三路加权 CE，best epoch 8/9/7，val CE 6.8635 / 6.8657 / 6.8418）。
+- **只改推理采样超参**（temperature / top-p）。模型结构、词表、窗口切分、数据集划分、掩码规则全部继承 E2/E3。
+- **重要约束（已知不可通过采样修复）**：E2/E3 记录的底层缺陷 —— duration / time-shift 词表长尾、细档 token 识别准确率低
+  （duration head 验证集 token acc 仅 6.53%），**采样策略只能改变生成多样性与非法事件比例，无法提升细档判别能力**。
+- 禁止加载非 best-val 的过拟合权重；禁止训练/finetune/改权重；评估禁止开任何 MIDI 规则后处理或时长钳位。
+
+### 7.1 代码改动（commit `待补`）
+
+| 文件 | 改动 |
+|---|---|
+| `symbolic_features.py` | **新增**。46 维符号统计特征（pitch-class 12 + 有向音程 12 + log-时值 8 + log-IOI 8 + 音高统计 2 + 音符密度 1 + 调式符合度 1 + 装饰音占比 2），维数分块与 exp3 记录一致；另有 `pairwise_distance_matrix()` 供多样性度量。注：原 `feature_extractor.py` 实为**音频**特征（librosa F0/MFCC），不含该 46 维符号特征；exp3 的临时脚本未入库，故按文档口径重建。 |
+| `configs/e4_sampling_search.yaml` | **新增**。网格 T∈{0.6,0.8,1.0,1.2} × top-p∈{0.7,0.8,0.9,0.95}；权重模板 `checkpoints/e3/L3_seed{seed}/best_valloss_model.pt`；窗口继承 E2/E3（256 事件、val 步长 256 → 10 窗口）；prompt 16 → 总长 256；`postprocess.*` 四开关全部 False（仅预留）；非法事件/重复率/多样性/产物路径配置。 |
+| `generate_music.py` | `_filter_and_sample` 新增 `generator` 参数；`generate_compound_autoregressive` 新增 `temperature` / `top_p` / `top_k` / `generator` / `prepend_bos`（默认沿用 e1 基线 → 旧行为逐位不变）；新增 E4 小节：`build_midi_name()`、`_rng_seed()`、`load_val_windows()`、`load_e4_model()`、`run_sampling_search()`；新增 `--mode sampling_search` CLI（保留原 main 不动）。输入序列 Prepend BOS（`[BOS] + 事件序列`），与训练样本输入格式一致。 |
+| `tests/test_sampling_consistency.py` | **新增**。T0 配置约束 / T1 可复现 / T2 随机流生效 / T3 采样参数生效 / T4 prompt 对齐 / T5 窗口口径 / T6 命名规范 / T7 46 维特征，共 23 项。 |
+
+### 7.2 单元测试结果（**23/23 PASS**，设备 cuda，commit `待补`）
+
+明细：`results/e4/e4_sampling_consistency_test.json`
+
+- **T1 可复现**：同权重 + 同 (T=0.8, p=0.9) + 同 rng_seed=1849095758 跑两次 → 三路 256 事件序列**逐位相同**。
+- **T2 随机流生效**：换 rng_seed → 序列不同（证明可复现不是"退化成贪心"）。
+- **T3 采样参数生效**：T 0.8→1.2、top-p 0.9→0.7 在同一 rng 下序列均改变。
+- **T4 prompt 对齐**：生成序列前 16 个事件 == 窗口 GT 前 16 个事件（pitch/duration/shift 三路逐位）；总长 = 256 事件。
+- **T5 窗口口径**：10 个验证窗口（dapu14kouhuangtian 4 + dapu15wujinjiao 6），窗口长度 256，编号/起始事件号与 `CompoundEventWindowDataset` records 一致，窗口数与 E3 `e3_window_stats.csv` 一致。
+- **T0 约束**：postprocess 四开关全 False、prompt=16、target=256、prepend_bos=True、评估 skip_prompt=16、top-k 全关、权重模板指向 E3-L3 best_val。
+- 每条序列的随机数流由独立 `torch.Generator` 决定，种子公式 `rng_seed = base + model_seed·97³ + grid_index·97² + window_index`（base=20260）。

@@ -33,8 +33,10 @@ E1 改动要点（复合事件 = pitch + duration + time-shift）：
 import os
 import csv
 import sys
+import time
 import random
-from typing import Tuple, List, Optional, Sequence, Dict
+import argparse
+from typing import Tuple, List, Optional, Sequence, Dict, Any
 
 import torch
 import torch.nn.functional as F
@@ -50,6 +52,7 @@ from dataset_nanyin import (
     get_val_dataset, NanyinDataset, VAL_SPLIT_IDS,
     NANYIN_FOUR_MODES, _MODE_PENTATONIC,
     CompoundEventCodec, get_compound_codec,
+    CompoundEventWindowDataset,
 )
 from models import NanyinBoYaTCN, NanyinMusicMamba
 from nanyin_config import load_config, get_section
@@ -225,11 +228,16 @@ def _filter_and_sample(
     temperature: float,
     top_p: float,
     top_k: int,
+    generator: Optional[torch.Generator] = None,
 ) -> int:
     """对单路属性 logits 做 temperature → top-k → top-p 过滤后多项式采样。
 
     安全兜底：若过滤后所有 logit 均为 -inf（极端情况），退化为均匀分布采样，
     避免 softmax 产生 NaN。
+
+    参数:
+        generator: E4 新增。传入独立的 torch.Generator 时，采样随机流由该发生器
+                   决定，与全局 RNG 解耦 → 同一 (权重, 采样参数, 随机种子) 组合可复现。
     """
     logits = logits / max(temperature, 1e-6)
 
@@ -250,7 +258,7 @@ def _filter_and_sample(
         logits = torch.zeros_like(logits)
 
     probs = F.softmax(logits, dim=-1)
-    return int(torch.multinomial(probs, num_samples=1).item())
+    return int(torch.multinomial(probs, num_samples=1, generator=generator).item())
 
 
 def generate_compound_autoregressive(
@@ -261,6 +269,11 @@ def generate_compound_autoregressive(
     target_len: int,
     device: torch.device,
     codec: CompoundEventCodec = CODEC,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[Dict[str, int]] = None,
+    generator: Optional[torch.Generator] = None,
+    prepend_bos: bool = True,
 ) -> Dict[str, List[int]]:
     """
     复合事件口径的自回归生成：每一步**同时采样** pitch / duration / time-shift。
@@ -280,14 +293,35 @@ def generate_compound_autoregressive(
       - 序列末尾一步的 shift 在训练侧是伪标签，生成时该值不会被使用（最后一个音符之后
         没有下一个音符），仅保留在序列中以 succeeded 长度一致。
 
+    E4 新增参数（只影响采样行为，不改变序列长度/prompt 规则）：
+        temperature: 三路共用的采样温度；None 时沿用 e1 yaml 的分路默认值
+        top_p:       三路共用的 nucleus 阈值；None 时沿用 e1 yaml 默认值
+        top_k:       {"pitch": int, "duration": int, "shift": int}；None 时沿用默认值
+        generator:   独立的 torch.Generator —— 用于固定随机种子下的结果复现
+        prepend_bos: 输入序列是否以各路 BOS 开头（**True 时与训练样本输入格式一致**）
+
     返回:
-        {"pitch_ids": [...], "duration_ids": [...], "shift_ids": [...]}
+        {"pitch_ids": [...], "duration_ids": [...], "shift_ids": [...]}（长度 = target_len）
     """
     p_ids: List[int] = list(prompt_pitch_ids)
     d_ids: List[int] = list(prompt_duration_ids)
     s_ids: List[int] = list(prompt_shift_ids)
     prompt_len = len(p_ids)
     actual_target = min(target_len, MAX_SEQ_LEN)
+
+    # E4：三路采样超参（未显式传入时沿用 e1 yaml 的分路默认值 → 旧行为逐位不变）
+    t_pitch = float(PITCH_TEMPERATURE) if temperature is None else float(temperature)
+    t_duration = float(DURATION_TEMPERATURE) if temperature is None else float(temperature)
+    t_shift = float(SHIFT_TEMPERATURE) if temperature is None else float(temperature)
+    p_top_p = float(PITCH_TOP_P) if top_p is None else float(top_p)
+    p_duration_p = float(DURATION_TOP_P) if top_p is None else float(top_p)
+    p_shift_p = float(SHIFT_TOP_P) if top_p is None else float(top_p)
+    if top_k is None:
+        k_pitch, k_duration, k_shift = PITCH_TOP_K, DURATION_TOP_K, SHIFT_TOP_K
+    else:
+        k_pitch = int(top_k.get("pitch", PITCH_TOP_K))
+        k_duration = int(top_k.get("duration", DURATION_TOP_K))
+        k_shift = int(top_k.get("shift", SHIFT_TOP_K))
 
     with torch.no_grad():
         for _ in range(prompt_len, actual_target):
@@ -297,6 +331,12 @@ def generate_compound_autoregressive(
                 ctx_s = s_ids[-MAX_GEN_CONTEXT_LEN:]
             else:
                 ctx_p, ctx_d, ctx_s = p_ids, d_ids, s_ids
+
+            # E4：与训练样本输入格式对齐 → 输入 = [BOS] + 事件序列
+            if prepend_bos:
+                ctx_p = [codec.pitch_bos_id] + list(ctx_p)
+                ctx_d = [codec.duration_bos_id] + list(ctx_d)
+                ctx_s = [codec.shift_bos_id] + list(ctx_s)
 
             input_p = torch.tensor([ctx_p], dtype=torch.long, device=device)
             input_d = torch.tensor([ctx_d], dtype=torch.long, device=device)
@@ -309,13 +349,13 @@ def generate_compound_autoregressive(
             last_shift_logits = output["pred_shift_logits"][0, -1, :]
 
             next_pitch = _filter_and_sample(
-                last_pitch_logits, PITCH_TEMPERATURE, PITCH_TOP_P, PITCH_TOP_K
+                last_pitch_logits, t_pitch, p_top_p, k_pitch, generator
             )
             next_duration = _filter_and_sample(
-                last_duration_logits, DURATION_TEMPERATURE, DURATION_TOP_P, DURATION_TOP_K
+                last_duration_logits, t_duration, p_duration_p, k_duration, generator
             )
             next_shift = _filter_and_sample(
-                last_shift_logits, SHIFT_TEMPERATURE, SHIFT_TOP_P, SHIFT_TOP_K
+                last_shift_logits, t_shift, p_shift_p, k_shift, generator
             )
 
             p_ids.append(next_pitch)
@@ -497,6 +537,226 @@ def append_generate_row(
 
 
 # ==============================================================================
+# E4：固定权重 + temperature / top-p 网格搜索
+# ==============================================================================
+#
+# ⚠ E4 硬性约束（写在此处以免后续误改）：
+#   1. 不训练、不微调、不改权重 —— 只加载 E3-L3 三组种子的 best-val 早停 checkpoint；
+#   2. prompt 规则固定：每个验证窗口取前 16 个 GT 事件，自回归续写到总长度 256 事件；
+#   3. 禁止任何 MIDI 后处理 / 时值钳位修正（配置 postprocess.* 全 false），评估用原生输出；
+#   4. 每条序列的随机流由独立的 torch.Generator 决定，种子由 _rng_seed() 显式计算 → 可复现。
+# ==============================================================================
+
+E4_DEFAULT_CONFIG: str = os.path.join(_SCRIPT_DIR, "configs", "e4_sampling_search.yaml")
+
+
+def build_midi_name(song_id: str, window_index: int, model_seed: int,
+                    temperature: float, top_p: float) -> str:
+    """E4 生成产物命名：{song_id}_w{窗口号}_seed{模型种子}_T{temp}_p{topp}.mid"""
+    t_tag = f"{float(temperature):g}".replace(".", "")
+    p_tag = f"{float(top_p):g}".replace(".", "")
+    return f"{song_id}_w{window_index}_seed{model_seed}_T{t_tag}_p{p_tag}.mid"
+
+
+def _rng_seed(base: int, model_seed: int, grid_index: int, window_index: int,
+              seed_slot: int = 97) -> int:
+    """E4 每条序列独立的随机种子（确定性公式，保证可复现）。
+
+        rng_seed = base + model_seed * seed_slot ** 3 + grid_index * seed_slot ** 2 + window_index
+
+    说明：模型种子之间的间隔足够大，避免不同 (模型种子, 网格点, 窗口) 组合碰撞。
+    """
+    return int(base) + int(model_seed) * (seed_slot ** 3) + int(grid_index) * (seed_slot ** 2) + int(window_index)
+
+
+def load_val_windows(cfg: dict, verbose: bool = True) -> List[Dict[str, Any]]:
+    """构建 E2/E3 口径的验证窗口（非重叠，10 个）并返回 GT 事件列表。
+
+    每个元素:
+        {"song_id", "window_index", "pitch_ids", "duration_ids", "shift_ids"}
+        其中 *_ids 为**训练同源顺序**（onset 升序）的事件序列，长度 = window_size。
+    """
+    wcfg = cfg["window"]
+    window_size = int(wcfg["window_size_events"])
+    val_ds = CompoundEventWindowDataset(
+        song_ids=VAL_SPLIT_IDS,
+        split=wcfg.get("split", "val"),
+        cfg=cfg,
+    )
+    _ = verbose  # 保留参数位（窗口统计由 dataset 内部 verbose=True 打印）
+    windows: List[Dict[str, Any]] = []
+    for i in range(len(val_ds)):
+        sample = val_ds[i]
+        # 目标序列 = target_*_ids[0:window_size]（末尾一个元素是 EOS）
+        tgt_p = sample["target_pitch_ids"][:window_size].tolist()
+        tgt_d = sample["target_duration_ids"][:window_size].tolist()
+        tgt_s = sample["target_shift_ids"][:window_size].tolist()
+        # 窗口末尾 shift 在训练侧是伪标签（-100），GT 侧统一还原为 PAD(0)
+        tgt_s[-1] = 0
+        windows.append({
+            "song_id": sample["song_id"],
+            "window_index": int(sample["window_index"]),
+            "start": int(sample["start"]),
+            "end": int(sample["end"]),
+            "pitch_ids": tgt_p,
+            "duration_ids": tgt_d,
+            "shift_ids": tgt_s,
+        })
+    if verbose:
+        print(f"[E4] 验证窗口: {len(windows)} 个 "
+              f"({', '.join(sorted({w['song_id'] for w in windows}))}), "
+              f"窗口长度={window_size} 事件")
+    return windows
+
+
+def load_e4_model(ckpt_path: str, device: torch.device, strict: bool = True):
+    """加载 E3-L3 的 NanyinBoYaTCN best-val 权重。"""
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"[E4] 权重文件不存在: {ckpt_path}")
+    model = NanyinBoYaTCN().to(device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
+    model.eval()
+    print(f"[E4] 已加载权重: {ckpt_path} (epoch={checkpoint.get('epoch', '?')}, "
+          f"val_loss={checkpoint.get('val_loss', float('nan')):.4f})")
+    return model
+
+
+def run_sampling_search(
+    cfg: Optional[dict] = None,
+    model_seeds: Optional[Sequence[int]] = None,
+    temperature_grid: Optional[Sequence[float]] = None,
+    top_p_grid: Optional[Sequence[float]] = None,
+    device: Optional[torch.device] = None,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """E4 主流程：固定权重 × temperature/top-p 网格 × 10 个验证窗口 → MIDI + 清单 CSV。
+
+    参数:
+        cfg:              E4 配置字典（None 时读 configs/e4_sampling_search.yaml）
+        model_seeds:      覆盖配置里的模型训练种子列表
+        temperature_grid: 覆盖温度网格
+        top_p_grid:       覆盖 top-p 网格
+        device:           推理设备
+        overwrite:        已存在的 MIDI 是否重新生成
+    返回:
+        {"num_generated": int, "csv": str, "midi_dir": str}
+    """
+    cfg = cfg if cfg is not None else load_config(E4_DEFAULT_CONFIG)
+    wcfg = cfg["window"]
+    scfg = cfg["sampling"]
+    acfg = cfg["weights"]
+    outcfg = cfg["outputs"]
+
+    model_seeds = list(model_seeds) if model_seeds is not None else list(acfg["model_seeds"])
+    temps = list(temperature_grid) if temperature_grid is not None else list(scfg["temperature_grid"])
+    topps = list(top_p_grid) if top_p_grid is not None else list(scfg["top_p_grid"])
+    top_k_map = dict(scfg["top_k"])
+    prompt_len = int(wcfg["prompt_len_events"])
+    target_len = int(wcfg["target_len_events"])
+    prepend_bos = bool(wcfg.get("prepend_bos", True))
+    rng_base = int(scfg["rng_base_seed"])
+    ckpt_tpl = acfg["checkpoint_template"]
+    strict = bool(acfg.get("strict_load", True))
+
+    midi_dir = os.path.join(_SCRIPT_DIR, str(outcfg["midi_dir"]))
+    csv_path = os.path.join(_SCRIPT_DIR, str(outcfg["generate_list_csv"]))
+    os.makedirs(midi_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("=" * 70)
+    print("E4: 固定权重 + temperature / top-p 采样超参网格搜索")
+    print("=" * 70)
+    print(f"  推理设备      : {device}")
+    print(f"  模型权重      : {acfg['source_stage']} best-val × 种子 {model_seeds}")
+    print(f"  网格          : temperature={temps} × top_p={topps} → {len(temps) * len(topps)} 组")
+    print(f"  prompt 规则   : 每窗口前 {prompt_len} 个 GT 事件 → 续写到总长 {target_len} 事件")
+    print(f"  后处理        : 全部关闭（原生输出）")
+    print(f"  MIDI 输出目录 : {midi_dir}")
+
+    windows = load_val_windows(cfg, verbose=True)
+
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "song_id", "window_index", "window_start_event", "window_end_event",
+            "model_seed", "checkpoint", "temperature", "top_p",
+            "top_k_pitch", "top_k_duration", "top_k_shift",
+            "rng_seed", "prompt_len", "target_len", "num_events",
+            "output_midi_path",
+        ])
+
+    generated = 0
+    t_start = time.time()
+
+    for model_seed in model_seeds:
+        ckpt_path = ckpt_tpl.format(seed=model_seed)
+        model = load_e4_model(ckpt_path, device, strict=strict)
+
+        grid_pairs = [(t, p) for t in temps for p in topps]
+        for g_i, (temp, tpp) in enumerate(grid_pairs):
+            print(f"[E4] seed={model_seed} T={temp:g} p={tpp:g} "
+                  f"({g_i + 1}/{len(grid_pairs)})")
+            rows: List[List[Any]] = []
+            for win in windows:
+                fname = build_midi_name(
+                    win["song_id"], win["window_index"], model_seed, temp, tpp
+                )
+                midi_path = os.path.join(midi_dir, fname)
+                rng = _rng_seed(rng_base, model_seed, g_i, win["window_index"])
+
+                if overwrite or not os.path.exists(midi_path):
+                    gen = torch.Generator(device=device.type)
+                    gen.manual_seed(rng)
+                    events = generate_compound_autoregressive(
+                        model=model,
+                        prompt_pitch_ids=win["pitch_ids"][:prompt_len],
+                        prompt_duration_ids=win["duration_ids"][:prompt_len],
+                        prompt_shift_ids=win["shift_ids"][:prompt_len],
+                        target_len=target_len,
+                        device=device,
+                        codec=CODEC,
+                        temperature=temp,
+                        top_p=tpp,
+                        top_k=top_k_map,
+                        generator=gen,
+                        prepend_bos=prepend_bos,
+                    )
+                    # ---- 原生输出直写 MIDI：**无任何后处理 / 钳位** ----
+                    notes = events_to_notes(
+                        events["pitch_ids"], events["duration_ids"],
+                        events["shift_ids"], codec=CODEC,
+                    )
+                    notes_to_midi(
+                        notes, output_path=midi_path,
+                        velocities=compute_velocities(len(notes)),
+                    )
+
+                rows.append([
+                    win["song_id"], win["window_index"], win["start"], win["end"],
+                    model_seed, ckpt_path, temp, tpp,
+                    top_k_map.get("pitch", 0), top_k_map.get("duration", 0), top_k_map.get("shift", 0),
+                    rng, prompt_len, target_len, target_len, midi_path,
+                ])
+
+            with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f).writerows(rows)
+            generated += len(rows)
+
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    elapsed = time.time() - t_start
+    print(f"\n[E4] 网格生成完成: {generated} 条 MIDI, 耗时 {elapsed / 60:.1f} 分钟")
+    print(f"  清单 CSV: {csv_path}")
+    return {"num_generated": generated, "csv": csv_path, "midi_dir": midi_dir}
+
+
+# ==============================================================================
 # 六、主流程：批量生成
 # ==============================================================================
 
@@ -651,6 +911,24 @@ def main() -> None:
 # 七、脚本入口
 # ==============================================================================
 
+def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """命令行入口参数。"""
+    parser = argparse.ArgumentParser(description="南音符号旋律推理生成")
+    parser.add_argument(
+        "--mode", default="default", choices=["default", "sampling_search"],
+        help="default = E1 批量生成；sampling_search = E4 temperature/top-p 网格搜索",
+    )
+    parser.add_argument(
+        "--config", default=None,
+        help="覆盖层 YAML 路径（默认 default 模式不读；sampling_search 默认 configs/e4_sampling_search.yaml）",
+    )
+    parser.add_argument("--seeds", default=None, help="模型训练种子列表，逗号分隔（覆盖配置）")
+    parser.add_argument("--temperatures", default=None, help="temperature 网格，逗号分隔（覆盖配置）")
+    parser.add_argument("--topps", default=None, help="top-p 网格，逗号分隔（覆盖配置）")
+    parser.add_argument("--overwrite", action="store_true", help="已存在的 MIDI 也重新生成")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
     """
     独立运行说明:
@@ -660,7 +938,21 @@ if __name__ == "__main__":
 
     完整运行命令 (Windows):
       venv/Scripts/python.exe generate_music.py
+      venv/Scripts/python.exe generate_music.py --mode sampling_search \
+          --config configs/e4_sampling_search.yaml
     """
     # Windows GBK 终端兼容：强制 UTF-8 输出
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # pyright: ignore
-    main()
+
+    args = _parse_args()
+    if args.mode == "sampling_search":
+        cfg = load_config(args.config) if args.config else load_config(E4_DEFAULT_CONFIG)
+        seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else None
+        temps = [float(s) for s in args.temperatures.split(",")] if args.temperatures else None
+        topps = [float(s) for s in args.topps.split(",")] if args.topps else None
+        run_sampling_search(
+            cfg=cfg, model_seeds=seeds, temperature_grid=temps,
+            top_p_grid=topps, overwrite=args.overwrite,
+        )
+    else:
+        main()

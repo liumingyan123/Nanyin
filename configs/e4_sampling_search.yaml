@@ -1,0 +1,105 @@
+# E4 阶段配置：固定权重 + temperature / top-p 采样超参网格搜索
+# ==========================================================
+#
+# 【E4 硬性约束】
+#   1. **不做任何训练**：权重全部来自 E3-L3 三组随机种子的 best-val 早停 checkpoint
+#      （早停监控口径 = 验证集三路加权 CE，与 E2 同口径）；禁止加载非 best-val 的过拟合权重。
+#   2. **只改推理采样超参**：模型结构 / 词表 / 窗口切分 / 数据集划分 / 掩码规则全部继承 E2/E3。
+#   3. **禁止任何 MIDI 后处理与时长钳位修正**：评估使用模型原生输出；
+#      `postprocess.enable_clamp` / `enable_deduplicate` / `enable_legato_fix` / `enable_rescale`
+#      一律 false（仅预留开关，本实验强制关闭）。
+#   4. 已知底层缺陷（采样策略无法修复，E2/E3 已记录）：duration / time-shift 词表长尾、
+#      细档 token 识别准确率低（duration head 验证集 token acc 仅 ~6.5%）。
+#
+# 用法：
+#   venv/Scripts/python.exe generate_music.py --mode sampling_search --config configs/e4_sampling_search.yaml
+#   venv/Scripts/python.exe evaluate_e4_sampling.py --config configs/e4_sampling_search.yaml
+#
+# 生成产物命名：{song_id}_w{窗口号}_seed{模型种子}_T{temperature}_p{top_p}.mid
+
+experiment:
+  name: E4_sampling_search
+  branch: experiment/E4_sampling_search
+  note: "固定 E3-L3 权重(3籽)，temperature × top-p 网格搜索；只改采样，不训练"
+
+# ------------------------------------------------------------------------------
+# 固定权重（E3-L3 best-val 早停 checkpoint）
+# ------------------------------------------------------------------------------
+weights:
+  source_stage: E3_L3
+  # 三个训练随机种子 → 各自 best-val checkpoint（E3-L3 早停轮数 27/29/27，best epoch 8/9/7）
+  model_seeds: [2026, 2027, 2028]
+  checkpoint_template: checkpoints/e3/L3_seed{seed}/best_valloss_model.pt
+  model_class: NanyinBoYaTCN
+  strict_load: true
+
+# ------------------------------------------------------------------------------
+# 窗口 / 数据（继承 E2/E3，禁止改动）
+# ------------------------------------------------------------------------------
+window:
+  window_size_events: 256
+  train_stride_events: 128        # 仅占位（E4 只用 val 集），与 E2/E3 逐位一致
+  eval_stride_events: 256        # 验证集非重叠窗口 → 10 个（dapu14 × 4 + dapu15 × 6）
+  drop_tail: true                # 与 E2/E3 一致
+  prompt_len_events: 16          # prompt = 每个验证窗口前 16 个 GT 事件
+  target_len_events: 256         # 总长度含 prompt：16 prompt + 240 续写
+  split: val
+  # 输入构造与训练样本保持一致：[BOS] + 已生成的事件序列
+  prepend_bos: true
+  max_context_len: 512           # 生成时的上下文截断（来自 e1 yaml generation.max_gen_context_len）
+
+# ------------------------------------------------------------------------------
+# 采样参数网格
+# ------------------------------------------------------------------------------
+sampling:
+  # 三路共用同一组 temperature / top-p（网格变量），top-k 固定沿用 e1 基线
+  temperature_grid: [0.6, 0.8, 1.0, 1.2]
+  top_p_grid: [0.7, 0.8, 0.9, 0.95]
+  top_k:
+    pitch: 0           # 0 = 不过滤（沿用 e1 基线 pitch_top_k 亦为 50，此处统一关闭以隔离 top-p 变量）
+    duration: 0
+    shift: 0
+  # 推理随机种子：每条序列独立取种（可复现），公式见 generate_music._rng_seed()
+  rng_base_seed: 20260
+  # 多样本 offender 保护：过滤后全 -inf 时退化为均匀分布（沿用 _filter_and_sample 兜底）
+
+# ------------------------------------------------------------------------------
+# 后处理（【E4 强制关闭】仅预留开关）
+# ------------------------------------------------------------------------------
+postprocess:
+  enable_clamp: false           # 时值钳位修正
+  enable_deduplicate: false     # 相邻重复 token 合并
+  enable_legato_fix: false      # 连奏重叠修正
+  enable_rescale: false         # 时长整体缩放校准
+
+# ------------------------------------------------------------------------------
+# 评估
+# ------------------------------------------------------------------------------
+evaluation:
+  skip_prompt: 16                # 评估区域 = 跳过前 16 个 prompt 的 240 个事件
+  gt_ceiling_skip_prompt: 0      # GT 天花板（GT vs 自身）不跳过
+  illegal:
+    # 非法事件定义（**窗口最后 1 个事件的 shift 是伪标签，不计入**）
+    pitch_special_threshold: 128       # pitch id >= 128 → BOS/EOS 特殊 token
+    duration_valid_max: 402            # duration 真实类别数 402（id >= 402 为特殊 token）
+    shift_valid_max: 1002              # shift 真实类别数 1002
+    pad_value: 0                       # id == 0 → PAD / 未定义
+  repetition:
+    ngram: 4                           # 序列重复率：4-gram 重复占比
+  diversity:
+    metric: euclidean                  # 46 维特征两两欧氏距离（symbolic_features.pairwise_distance_matrix）
+    normalize: false                   # 不标准化（46 维各分量已在 [0,1]）
+
+# ------------------------------------------------------------------------------
+# 产物路径
+# ------------------------------------------------------------------------------
+outputs:
+  midi_dir: results/e4/generated_midi
+  generate_list_csv: results/e4/e4_generate_list.csv
+  eval_rows_csv: results/e4/e4_eval_rows.csv
+  eval_summary_csv: results/e4/e4_eval_summary.csv
+  eval_summary_json: results/e4/e4_eval_summary.json
+  heatmap_composite_png: reports/e4/e4_heatmap_composite.png
+  heatmap_illegal_png: reports/e4/e4_heatmap_illegal.png
+  heatmap_diversity_png: reports/e4/e4_heatmap_diversity.png
+  summary_md: reports/E4_sampling_search_summary.md
