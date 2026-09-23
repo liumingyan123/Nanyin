@@ -96,6 +96,9 @@ evaluation:
 outputs:
   midi_dir: results/e4/generated_midi
   generate_list_csv: results/e4/e4_generate_list.csv
+  # 原始三路事件序列（每一位 token），评估直接读它，**不经过 MIDI 往返**，
+  # 从而保留非法 token（如 pitch>=128 的特殊 token）供非法率统计。
+  events_jsonl: results/e4/e4_events.jsonl
   eval_rows_csv: results/e4/e4_eval_rows.csv
   eval_summary_csv: results/e4/e4_eval_summary.csv
   eval_summary_json: results/e4/e4_eval_summary.json

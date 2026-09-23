@@ -33,6 +33,7 @@ E1 改动要点（复合事件 = pitch + duration + time-shift）：
 import os
 import csv
 import sys
+import json
 import time
 import random
 import argparse
@@ -661,8 +662,10 @@ def run_sampling_search(
 
     midi_dir = os.path.join(_SCRIPT_DIR, str(outcfg["midi_dir"]))
     csv_path = os.path.join(_SCRIPT_DIR, str(outcfg["generate_list_csv"]))
+    events_jsonl = os.path.join(_SCRIPT_DIR, str(outcfg.get("events_jsonl", "results/e4/e4_events.jsonl")))
     os.makedirs(midi_dir, exist_ok=True)
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(events_jsonl) or ".", exist_ok=True)
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -679,6 +682,10 @@ def run_sampling_search(
 
     windows = load_val_windows(cfg, verbose=True)
 
+    # 原始事件流水：每次运行重建，避免跨运行残留
+    with open(events_jsonl, "w", encoding="utf-8") as f:
+        pass
+
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -692,6 +699,26 @@ def run_sampling_search(
     generated = 0
     t_start = time.time()
 
+    # 已存在的 (窗口, 种子, T, p) 组合 → 断点续跑时跳过（避免重复计算，也避免 MIDI 与
+    # 事件流水不一致）。overwrite=True 时无视该缓存强行重跑。
+    done_keys = set()
+    if os.path.exists(events_jsonl):
+        with open(events_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    done_keys.add((
+                        rec["song_id"], int(rec["window_index"]), int(rec["model_seed"]),
+                        round(float(rec["temperature"]), 6), round(float(rec["top_p"]), 6),
+                    ))
+                except json.JSONDecodeError:
+                    continue
+    if done_keys:
+        print(f"[E4] 已存在 {len(done_keys)} 条事件记录 → 跳过这些组合（overwrite={overwrite}）")
+
     for model_seed in model_seeds:
         ckpt_path = ckpt_tpl.format(seed=model_seed)
         model = load_e4_model(ckpt_path, device, strict=strict)
@@ -701,6 +728,7 @@ def run_sampling_search(
             print(f"[E4] seed={model_seed} T={temp:g} p={tpp:g} "
                   f"({g_i + 1}/{len(grid_pairs)})")
             rows: List[List[Any]] = []
+            event_records: List[Dict[str, Any]] = []
             for win in windows:
                 fname = build_midi_name(
                     win["song_id"], win["window_index"], model_seed, temp, tpp
@@ -708,7 +736,10 @@ def run_sampling_search(
                 midi_path = os.path.join(midi_dir, fname)
                 rng = _rng_seed(rng_base, model_seed, g_i, win["window_index"])
 
-                if overwrite or not os.path.exists(midi_path):
+                cache_key = (win["song_id"], win["window_index"], int(model_seed),
+                             round(float(temp), 6), round(float(tpp), 6))
+                need_run = overwrite or (cache_key not in done_keys)
+                if need_run:
                     gen = torch.Generator(device=device.type)
                     gen.manual_seed(rng)
                     events = generate_compound_autoregressive(
@@ -735,6 +766,22 @@ def run_sampling_search(
                         velocities=compute_velocities(len(notes)),
                     )
 
+                    # ---- 原始三路 token 序列落盘（评估直接读，避免 MIDI 往返丢失非法 token）----
+                    event_records.append({
+                        "song_id": win["song_id"],
+                        "window_index": win["window_index"],
+                        "model_seed": int(model_seed),
+                        "temperature": float(temp),
+                        "top_p": float(tpp),
+                        "rng_seed": int(rng),
+                        "prompt_len": prompt_len,
+                        "target_len": target_len,
+                        "pitch_ids": list(events["pitch_ids"]),
+                        "duration_ids": list(events["duration_ids"]),
+                        "shift_ids": list(events["shift_ids"]),
+                        "midi_path": midi_path,
+                    })
+
                 rows.append([
                     win["song_id"], win["window_index"], win["start"], win["end"],
                     model_seed, ckpt_path, temp, tpp,
@@ -744,6 +791,10 @@ def run_sampling_search(
 
             with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
                 csv.writer(f).writerows(rows)
+            if event_records:
+                with open(events_jsonl, "a", encoding="utf-8") as f:
+                    for rec in event_records:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             generated += len(rows)
 
         del model
