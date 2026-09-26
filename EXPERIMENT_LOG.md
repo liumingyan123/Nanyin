@@ -828,3 +828,121 @@ venv/Scripts/python.exe train_boyatcn.py --mode compound --model musicmamba \
 
 → **结论：全部 PASS，允许启动批量生成。**
 
+
+### 7.6 批量生成结果（任务A/B 数据）
+
+命令：`venv/Scripts/python.exe generate_music.py --mode model_drift --config configs/e5_model_drift.yaml`
+耗时 7.3 分钟，**240 条序列全部生成，无缺失**：
+
+- MIDI：`results/e5/generated_midi/{song_id}_w{w}_{model}_seed{s}_len{L}.mid`（240 个）
+- 清单：`results/e5/e5_generate_list.csv`（240 行；字段：曲号/窗口号/窗口起止事件/模型名/训练种子/checkpoint/采样参数/rng_seed/prompt_len/target_len/MIDI 路径）
+- 原始三路 token：`results/e5/e5_events.jsonl`（评估直读 token，保留非法 token，不经 MIDI 往返）
+
+### 7.7 Tier-1 批量评估结果
+
+GT 天花板（GT vs 自身，不跳过 prompt）：**composite = 82.76 ± 1.60**
+（mode 86.88、rhythm 60.29、tempo 100.00、ornament_score 76.14、ornament_density 87.96）
+
+#### 任务A（len=256，每模型 30 样本 = 3 籽 × 10 窗口）
+
+| 指标 | BoYaTCN | MusicMamba | Δ |
+|---|---|---|---|
+| composite | 66.87 ± 2.87 | 65.88 ± 1.94 | +0.99 |
+| mode_matching_score | 83.96 ± 9.94 | **86.32 ± 8.78** | −2.36 |
+| rhythm_consistency | 56.92 ± 2.45 | 56.99 ± 1.74 | −0.07 |
+| tempo_accuracy | **84.69 ± 11.39** | 74.96 ± 10.26 | +9.73 |
+| ornament_score | 73.29 ± 1.59 | 72.85 ± 0.96 | +0.44 |
+| ornament_density | **77.93 ± 7.57** | 74.71 ± 3.61 | +3.23 |
+| pitch_accuracy | 8.49 ± 1.99 | 7.74 ± 2.05 | +0.75 |
+| gtDist（46 维，同起点等长 GT） | **0.527 ± 0.131** | 0.605 ± 0.136 | −0.079 |
+| 4-gram 重复率 | 0.190 | 0.216 | −0.026 |
+| 非法 token 占比 | 0.0000 | 0.0000 | 0 |
+
+配对差（同窗口 + 同训练种子）：30 对，均值 **+0.99**，标准差 2.90，BoYaTCN 胜 **18/30** 对
+→ **差距落在噪声范围内，判定为"基本持平、BoYaTCN 略占优"，不构成显著差异。**
+
+**重要负向观察（如实记录）**：MusicMamba 的 teacher-forcing 指标明显更好
+（val CE 6.7288 vs 6.8570；验证 pitch token acc 41.7% vs 35.7%；参数量少 36%），
+但自回归生成时的 Tier-1 质量并未占优（composite 略低、重复率更高、跨种子多样性更低）
+→ **teacher-forcing 能力 ≠ 自回归生成质量**。
+
+#### 任务B（自回归漂移）
+
+| 指标 | 模型 | 32 | 64 | 128 | 256 | △(256−32) |
+|---|---|---|---|---|---|---|
+| composite | BoYaTCN | 67.74 | 66.45 | 66.70 | 66.87 | −0.87 |
+| | MusicMamba | 66.98 | 66.80 | 64.43 | 65.88 | −1.11 |
+| gtDist | BoYaTCN | 1.106 | 0.705 | 0.657 | 0.527 | −0.579 |
+| | MusicMamba | 1.147 | 0.739 | 0.764 | 0.605 | −0.542 |
+| 4-gram 重复率 | BoYaTCN | 0.041 | 0.117 | 0.160 | **0.190** | **+0.149** |
+| | MusicMamba | 0.054 | 0.122 | 0.224 | **0.216** | **+0.162** |
+| pitch_accuracy | BoYaTCN | 14.58 | 11.11 | 9.08 | 8.49 | −6.10 |
+| | MusicMamba | 13.54 | 10.07 | 8.78 | 7.74 | −5.81 |
+| 跨种子多样性 | BoYaTCN | 1.121 | 0.723 | 0.607 | 0.508 | −0.613 |
+| | MusicMamba | 1.153 | 0.751 | 0.693 | 0.418 | −0.735 |
+| 非法 token 占比 | 两组 | 0 | 0 | 0 | 0 | 0 |
+
+要点：
+1. **漂移的真实证据 = 重复率单调上升（~3.6×）+ 逐位一致率单调下降**；二者互为印证。
+2. **composite 对漂移不敏感**（−0.9 / −1.1），不能单独判断长序列质量。
+3. **gtDist 随长度"下降"是小样本统计假象**：len=32 评估区仅 16 个事件，
+   46 维中 40 维直方图分量方差极大 → 距离被系统性高估。跨长度不可比，同长度内才有效。
+4. **非法率恒 0 的原因**：top-p=0.95 把尾部（含特殊 token）整体截断，
+   240 条序列续写片段中 pitch≥128 出现 0 次、**EOS(129) 出现 0 次**
+   → 副作用：生成**从不自然终止**，长度完全由人为 `target_len` 截断；
+   且该维度在本实验**没有分辨力**（0 值不代表模型不会输出非法 token）。
+5. **长序列退化更显著的是 MusicMamba**：重复率全程更高（256 处 0.216 vs 0.190，128 处差最大）、
+   跨种子多样性掉更快（0.418 vs 0.508）、len=128 出现 mode 谷值 78.83（σ=15.87，全表最差）
+   与 composite 全表最低 64.43（256 处回升，波动大于 BoYaTCN）。
+
+### 7.8 任务C：46 维 UMAP / t-SNE
+
+- 样本：**280 点** = 10 窗口 GT（按各长度同起点等长截取，GT-len32/64/128/256 各 10 点）
+  + 两组模型 × 3 籽 × 4 长度 × 10 窗口；
+- 预处理 StandardScaler；UMAP(n_neighbors=8, min_dist=0.1, seed=42)；
+  t-SNE(perplexity=5, max_iter=2000, init=pca, seed=42)，**与 exp3 完全一致**；
+- 特征**只取续写片段**（跳过 16 个 prompt），与评估口径严格对齐；
+- **未混入 exp3 旧 NOEF 单 token 样本**（两套事件表示特征空间不兼容）。
+
+簇中心到同长度 GT 簇中心的距离：
+
+| 降维 | 模型 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|
+| UMAP | BoYaTCN | 1.394 | 3.059 | 3.532 | 3.104 |
+| UMAP | MusicMamba | 1.753 | 3.907 | 4.104 | 4.390 |
+| t-SNE | BoYaTCN | 21.11 | 48.24 | 52.73 | 48.71 |
+| t-SNE | MusicMamba | 27.45 | 55.60 | 68.25 | 68.95 |
+
+定性解读：两种方法方向一致 —— 生成点随续写长度远离 GT 簇，MusicMamba 在每个长度上都更远；
+len=128 的 MusicMamba 最散最远，与 §7.7 该长度 mode/composite 谷值吻合。
+⚠ len=32 距离小有一部分是**小样本效应**；受样本量限制，**降维图仅作定性辅助，不用于定量论断**。
+
+### 7.9 E5 结论
+
+1. 同等条件下 MusicMamba teacher-forcing 更强（CE 更低、pitch token acc 高 6pt），
+   但自回归 Tier-1 生成质量并未更好（composite 略低 0.99、重复率更高、多样性更低）。
+2. 任务A 判为"基本持平、BoYaTCN 略优"，优势主要来自 tempo_accuracy(+9.7)，
+   配对 18/30 胜出 → 未达显著。
+3. 自回归漂移确实存在，最清晰证据是重复率上升与逐位一致率下降；composite 对漂移不敏感。
+4. 长序列下 MusicMamba 退化更显著（重复、掉多样性、中段 mode 崩塌）。
+5. 本阶段为纯推理评估，无法修复训练侧词表长尾缺陷；仅 Tier-1 符号指标，未做 Tier-2 音频/听测。
+
+### 7.10 E5 产物清单
+
+**代码/配置**：`configs/e5_model_drift.yaml`（新增）、`generate_music.py`（E5 生成分支）、
+`evaluate_e4_sampling.py`（`--stage e5` 分支，E4 路径逐行未改）、`train_boyatcn.py`（`--model` 切换骨干）、
+`tests/test_e5_infer_consistency.py`（新增）
+
+**权重**：`checkpoints/e5/musicmamba/L3_seed{2026,2027,2028}/best_valloss_model.pt`（补训）
++ 引用 `checkpoints/e3/L3_seed*/best_valloss_model.pt`（E3 只读）
+
+**训练产物**：`results/e3/L3_seed*_train_musicmamba.log`、`L3_seed*_train_log_musicmamba.csv`、
+`reports/e3/L3_seed*_loss_curve_musicmamba.png`、`results/e5/mm_*.out`
+
+**生成/评估产物**：`results/e5/generated_midi/*.mid`(240)、`e5_generate_list.csv`(240 行)、
+`e5_events.jsonl`(240 条)、`e5_eval_rows.csv`(240 行含 46 维特征)、`e5_eval_summary.csv`(8 组聚合)、
+`e5_eval_summary.json`（含 GT 天花板 + 降维簇中心距离）、`e5_infer_consistency_test.json`(28/28)
+
+**图表**：`reports/e5/e5_drift_lines.png`、`reports/e5/e5_umap_46d.png`、`reports/e5/e5_tsne_46d.png`
+
+**报告**：`reports/E5_model_compare_drift_summary.md`
