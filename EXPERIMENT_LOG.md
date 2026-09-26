@@ -648,7 +648,7 @@ mode_KL 稳定停在 0.16 附近（先验与真实音级分布存在不可消残
 
 ## 7. E4：固定权重 + temperature / top-p 采样超参网格搜索（分支 `experiment/E4_sampling_search`）
 
-### 7.0 前置背景与约束（写入 E4 全部产物头部）
+### 7.0 前置背景与约束
 
 - **E4 不做任何训练**。模型权重全部固定取自 **E3-L3 三组随机种子（2026/2027/2028）的 best-val 早停 checkpoint**
   （早停口径 = 验证集三路加权 CE，best epoch 8/9/7，val CE 6.8635 / 6.8657 / 6.8418）。
@@ -728,3 +728,103 @@ mode_KL 稳定停在 0.16 附近（先验与真实音级分布存在不可消残
    **下一步（E5 及以后）应回到词表 / 训练侧**：duration 词表粗化或对数分箱、粗粒度 IOI 词表、扩大验证窗口数。
 
 commit 记录：`9f8ce4f`（46 维特征 + E4 配置 + 采样参数化生成入口 + 一致性测试 23/23 PASS）。
+
+---
+
+## 7. E5 阶段：模型公平对比 + 自回归误差累积漂移（分支 `experiment/E5_model_compare_drift`）
+
+> **分支来源**：`experiment/E4_sampling_search` HEAD 新建。E2 / E3 / E4 分支与产物全部冻结只读。
+> **E5 允许新增文件**：`configs/e5_model_drift.yaml`、`tests/test_e5_infer_consistency.py`、`reports/E5_model_compare_drift_summary.md`（其余均为既有文件的定向扩展）。
+
+### 7.0 前置背景与约束（写入报告头部）
+
+- E5 全程**不训练、不微调、不修改权重**，推理权重全部取自 best-val 早停 checkpoint；
+  采样超参**固定为 E4 结论配置**：`temperature=1.0`、`top-p=0.95`、`top-k=0`。
+- 本实验属于**推理层面评估**，无法修复训练阶段的底层缺陷：duration / time-shift 词表长尾、
+  细档 token 识别准确率低（E2 记录 404 类中 219 类零样本；E3 五组消融下 duration token acc
+  稳定在 6.5~7.0%，无一超过 L0 基线）。所有观测现象如实记录，不做美化。
+
+### 7.1 阻塞点：仓库缺少"复合事件口径"的 MusicMamba 权重（已获用户授权补训）
+
+任务A 要求"完全对等条件下的公平对比"，但开工核查时发现：
+
+| 现有 MusicMamba 权重 | 状态 | 能否用于 E5 |
+|---|---|---|
+| `checkpoints/musicmamba/`、`exp2_musicmamba/`、`grid_musicmamba_*` | E1 之前的**旧单 token 表达**（vocab 128）产物 | ❌ 事件表示空间不兼容，指标不可比 |
+| `train_musicmamba.py` | 旧 NOEF 单 token 管线，无 `--mode compound` | ❌ 无复合事件训练路径 |
+| `models.NanyinMusicMamba` | 已具备三路输出头（`pitch/duration/shiftlogits`），与 `NanyinBoYaTCN` 输出结构一致 | ✅ 可直接替换骨干 |
+
+结论：**缺的只是"同等条件下的训练权重"**。经向用户请示并获明确授权（"授权前置训练 MusicMamba"），
+E5 增设一个**前置补训子阶段**，之后再进入纯推理评估。这是获得公平对比结果的唯一可行路径。
+
+### 7.2 代码改动（前置补训）
+
+`train_boyatcn.py`（**定向扩展，未整文件重写**，E2/E3 的 `train()` 与 `train_compound()` 主逻辑不动）：
+
+| 位置 | 改动 | 目的 |
+|---|---|---|
+| import | `from models import NanyinBoYaTCN, NanyinMusicMamba` | 支持骨干切换 |
+| `train_compound()` | 新增形参 `model_name: str = "boyatcn"`，默认值使 E2/E3 行为**逐位不变** | 引入唯一自变量（骨干） |
+| `_fmt()` 旁新增 `_fmt_out()` | 输出文件名追加 `_musicmamba` 后缀 | **防止覆盖 E3 既有日志 / CSV / PNG**（`results/e3/*_musicmamba.log` 为新增文件，E3 原文件未被改写） |
+| 模型构造 | `NanyinBoYaTCN() if boyatcn else NanyinMusicMamba()` | 公平替换 |
+| CLI | 新增 `--model {boyatcn,musicmamba}` | 命令行选择 |
+
+训练命令（**数据与超参与 E3-L3 逐位一致**：同一 `configs/e3_L3.yaml`、同一窗口切分、同一三路加权 CE
+1.0/0.7/0.7 + 时值分布 KL 1.0 + IOI 分布 KL 1.0，同一个 val-CE 早停 patience=20）：
+
+```
+venv/Scripts/python.exe train_boyatcn.py --mode compound --model musicmamba \
+    --config configs/e3_L3.yaml --checkpoint-dir checkpoints/e5/musicmamba/L3_seed{seed} --seed 2026|2027|2028
+```
+
+### 7.3 前置补训结果（MusicMamba，三籽）
+
+| seed | 总轮数 | best epoch | best val CE | 该轮 pitch / duration / shift acc (%) | 末轮 val CE |
+|---|---|---|---|---|---|
+| 2026 | 26 | 6 | 6.7406 | 40.70 / 6.96 / 24.24 | 9.2740 |
+| 2027 | 27 | 7 | 6.7637 | 42.06 / 7.28 / 22.16 | 9.4574 |
+| 2028 | 27 | 7 | **6.6820** | 42.22 / 7.39 / 24.12 | 9.4855 |
+| **均值** | 26.7 | 6.7 | **6.7288** | 41.66 / 7.21 / 23.51 | 9.4056 |
+
+对照 E3-L3 的 BoYaTCN 三籽均值：best val CE **6.8570**、acc 35.71 / 6.53 / 24.07。
+→ 在**完全相同的数据与损失**下，MusicMamba 的验证 CE 低 0.128、pitch token acc 高约 6 个百分点
+（2.18M 参数 vs BoYaTCN 3.43M）。**注意：这是 teacher-forcing 下的下一 token 预测能力，
+不等于自回归生成质量**，后者由任务 A/B 的实测给出。
+
+坑记录：seed=2028 首次训练时被 IDE 会话回收中断（日志停在 epoch 11），已重跑到早停完成；
+最终 best epoch=7 与中断前一致，ce 值相同，结果未受影响。
+
+产物：`checkpoints/e5/musicmamba/L3_seed{2026,2027,2028}/best_valloss_model.pt`、
+`results/e3/L3_seed{...}_train_musicmamba.log` + `_train_log_musicmamba.csv`、
+`reports/e3/L3_seed{...}_loss_curve_musicmamba.png`。
+
+### 7.4 E5 代码改动（推理与评估）
+
+| 文件 | 改动 |
+|---|---|
+| `configs/e5_model_drift.yaml`（新增） | 两组模型权重模板（各 3 籽 best-val）；prompt=16；`target_len_events_list: [32,64,128,256]`（**总长度口径**，含 prompt）；采样固定 T=1.0/p=0.95/k=0；`postprocess.*` 全 false；评估 `skip_prompt=16`；46 维降维超参（StandardScaler + UMAP n_neighbors=8/min_dist=0.1/seed=42 + t-SNE perplexity=5/max_iter=2000/init=pca/seed=42，与 exp3 完全一致） |
+| `generate_music.py` | 新增 `E5_DEFAULT_CONFIG`、`build_drift_midi_name()`、`resolve_e5_models()`、`load_e5_model()`（两种骨干）、`run_model_drift_generation()`；文件名 `{song_id}_w{w}_{model}_seed{s}_len{L}.mid`；每条序列独立 `torch.Generator`（`_rng_seed` 确定性公式）；MIDI 与原始三路 token 双写（评估直读 token，不经过 MIDI 往返 → 保留非法 token）；新增 CLI `--mode model_drift --models --lengths` |
+| `evaluate_e4_sampling.py` | 新增 `--stage {e4,e5}`；**E4 的 `evaluate_all` / `_heatmap` / 主流程一行未改**，e5 走新增分支：`evaluate_all_e5()`（Tier-1 逐条评估 → 明细 CSV → 按 (模型 × 长度) 聚合 mean±std + 跨籽多样性）、`_plot_drift_lines()`（任务B 四面板折线图）、`_cluster_info()` + `_plot_reduction()`（任务C UMAP/t-SNE + 簇中心到 GT 簇中心距离）。gtDist 采用**与生成片段同起点、等长**的 GT 区域，保证不同续写长度可比 |
+| `tests/test_e5_infer_consistency.py`（新增） | T0 配置与权重约束自检、T1 可复现、T2 prompt 对齐、T3 续写长度、T4 换种子序列变化（排除贪心退化）、T5 命名规范 |
+
+### 7.5 单元测试结果（**28/28 PASS**）
+
+判定明细：`results/e5/e5_infer_consistency_test.json`
+
+| 编号 | 校验项 | 结果 |
+|---|---|---|
+| T0-1 | `postprocess.*` 全部关闭（评估使用原生输出） | PASS |
+| T0-2 | 采样固定 T=1.0 / top_p=0.95 / top_k=0 | PASS |
+| T0-3 | prompt_len=16，窗口 256 / 步长 256（沿用 E2/E3/E4） | PASS |
+| T0-4 | 参与对比模型 = boyatcn + musicmamba | PASS |
+| T0-5 | 两组模型 best-val 早停权重齐备（各 3 籽，共 6 个） | PASS |
+| T0-6 | 验证窗口 = 10（dapu14×4 + dapu15×6），窗口长 256 | PASS |
+| T1-boyatcn / T1-musicmamba | 同 (权重, rng, 采样参数) 两次推理三路序列**逐位一致** | PASS |
+| T4-boyatcn / T4-musicmamba | 换 rng 种子后序列不同（未退化成贪心） | PASS |
+| T2-<model>-w0/w5/w9 | 生成序列前 16 事件 == 对应窗口 GT 前 16 事件（三路逐位） | PASS ×6 |
+| T2-<model>-region | 评估区域 = 续写片段（如 64 − 16 = 48 事件） | PASS ×2 |
+| T3-<model>-32/64/128/256 | target_len 正确输出 32 / 64 / 128 / 256 长度（三路一致） | PASS ×8 |
+| T5-1 / T5-2 | 文件名规范 `{song_id}_w{w}_{model}_seed{s}_len{L}.mid`，组合不重复 | PASS ×2 |
+
+→ **结论：全部 PASS，允许启动批量生成。**
+

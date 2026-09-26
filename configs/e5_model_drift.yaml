@@ -1,0 +1,136 @@
+# E5 阶段配置：模型公平对比 + 自回归误差累积漂移
+# ==========================================================
+#
+# 【E5 前置背景 / 硬性约束】
+#   1. **不做任何训练、不微调、不改权重**（仅限 E5 推理评估阶段）：
+#      两组模型全部加载 best-val 早停 checkpoint，禁止加载训练末轮过拟合权重。
+#      - BoYaTCN(E3-L3) 三籽权重：E3 阶段产物，直接引用，只读。
+#      - MusicMamba 三籽权重：E5 前置子阶段产物（经用户书面授权后补训，
+#        数据与训练超参与 E3-L3 **逐位一致**，唯一自变量为骨干网络）。
+#   2. **采样超参固定为 E4 结论配置**：temperature = 1.0，top-p = 0.95，top-k = 0（不过滤）。
+#   3. **本实验属于推理层面评估**，无法修复训练阶段的底层缺陷：
+#      duration / time-shift 词表长尾、细档 token 识别准确率低
+#      （E2/E3 已记录：duration head 验证 token acc 仅 6.5~7.0%）。
+#      所有观测现象如实记录，不做美化。
+#   4. **评估口径**：跳过 prompt 的前 16 个 GT 事件，仅对续写片段计算指标与特征；
+#      MIDI 后处理开关全部保留但强制 false，评估使用模型原生输出。
+#
+# 用法：
+#   venv/Scripts/python.exe generate_music.py --mode model_drift --config configs/e5_model_drift.yaml
+#   venv/Scripts/python.exe evaluate_e4_sampling.py --stage e5 --config configs/e5_model_drift.yaml
+#
+# 生成产物命名：{song_id}_w{窗口号}_{model_name}_seed{seed}_len{target_len}.mid
+
+experiment:
+  name: E5_model_compare_drift
+  branch: experiment/E5_model_compare_drift
+  note: "固定 best-val 权重 + T=1.0/p=0.95/k=0：任务A 模型公平对比；任务B 续写长度漂移；任务C 46维降维"
+
+# ------------------------------------------------------------------------------
+# 固定权重（best-val 早停 checkpoint）
+# ------------------------------------------------------------------------------
+models:
+  boyatcn:
+    enabled: true
+    class: NanyinBoYaTCN
+    source_stage: E3_L3
+    model_seeds: [2026, 2027, 2028]
+    checkpoint_template: checkpoints/e3/L3_seed{seed}/best_valloss_model.pt
+    strict_load: true
+  musicmamba:
+    enabled: true
+    class: NanyinMusicMamba
+    source_stage: E5_pre_E3_L3同等条件补训
+    model_seeds: [2026, 2027, 2028]
+    checkpoint_template: checkpoints/e5/musicmamba/L3_seed{seed}/best_valloss_model.pt
+    strict_load: true
+
+# ------------------------------------------------------------------------------
+# 窗口 / prompt（继承 E2/E3/E4，禁止改动）
+# ------------------------------------------------------------------------------
+window:
+  window_size_events: 256
+  train_stride_events: 128        # 仅占位（E5 只用 val 集），与 E2/E3/E4 逐位一致
+  eval_stride_events: 256         # 验证集非重叠窗口 → 10 个（dapu14 × 4 + dapu15 × 6）
+  drop_tail: true
+  prompt_len_events: 16           # prompt = 每个验证窗口前 16 个 GT 事件
+  # 任务B 续写长度集合：target_len = **含 prompt 的总序列长度**（与 E4 语义一致：
+  # 256 = 16 prompt + 240 续写；因此 32 = 16 prompt + 16 续写）
+  target_len_events_list: [32, 64, 128, 256]
+  split: val
+  prepend_bos: true               # 输入构造与训练样本一致：[BOS] + 已生成序列
+  max_context_len: 512
+
+# ------------------------------------------------------------------------------
+# 采样参数（**全局固定**，来自 E4 综合最优配置；本阶段不是自变量）
+# ------------------------------------------------------------------------------
+sampling:
+  temperature: 1.0
+  top_p: 0.95
+  top_k:
+    pitch: 0
+    duration: 0
+    shift: 0
+  # 每条序列的独立随机种子：同 E4 公式 base + seed*slot^3 + grid*slot^2 + win
+  # （此处 grid_index = 当前续写长度在 target_len_events_list 中的下标），
+  # 保证同一 (模型, 训练种子, 长度, 窗口) 组合可完全复现。
+  rng_base_seed: 20250
+  seed_slot: 97
+
+# ------------------------------------------------------------------------------
+# 后处理（【E5 强制关闭】仅预留开关）
+# ------------------------------------------------------------------------------
+postprocess:
+  enable_clamp: false           # 时值钳位修正
+  enable_deduplicate: false     # 相邻重复 token 合并
+  enable_legato_fix: false      # 连奏重叠修正
+  enable_rescale: false         # 时长整体缩放校准
+
+# ------------------------------------------------------------------------------
+# 评估（Tier-1 符号级，窗口级）
+# ------------------------------------------------------------------------------
+evaluation:
+  skip_prompt: 16                # 评估区域 = 跳过前 16 个 prompt 事件后的续写片段
+  gt_ceiling_skip_prompt: 0      # GT 天花板（GT vs 自身）不跳过
+  illegal:
+    pitch_special_threshold: 128
+    duration_valid_max: 402
+    shift_valid_max: 1002
+    pad_value: 0
+  repetition:
+    ngram: 4
+  gt_feature_match_length: true  # gtDist：GT 特征截取与生成片段**等长**的同一起点区域，
+
+# ------------------------------------------------------------------------------
+# 任务C：46 维符号特征降维（超参与 exp3 完全一致 → 可复现）
+# ------------------------------------------------------------------------------
+reduction:
+  scaler: standard                # StandardScaler
+  umap:
+    n_neighbors: 8
+    min_dist: 0.1
+    random_state: 42
+  tsne:
+    perplexity: 5
+    max_iter: 2000
+    init: pca
+    random_state: 42
+  # 仅提取【续写片段】的 46 维特征，严格与评估口径对齐；
+  # 禁止混入 exp3 旧 NOEF 单 token 样本（两套事件表示特征空间不兼容）。
+
+# ------------------------------------------------------------------------------
+# 产物路径
+# ------------------------------------------------------------------------------
+outputs:
+  midi_dir: results/e5/generated_midi
+  generate_list_csv: results/e5/e5_generate_list.csv
+  events_jsonl: results/e5/e5_events.jsonl
+  eval_rows_csv: results/e5/e5_eval_rows.csv
+  eval_summary_csv: results/e5/e5_eval_summary.csv
+  eval_summary_json: results/e5/e5_eval_summary.json
+  # 任务B 漂移折线图
+  drift_line_png: reports/e5/e5_drift_lines.png
+  # 任务C 降维图
+  umap_png: reports/e5/e5_umap_46d.png
+  tsne_png: reports/e5/e5_tsne_46d.png
+  summary_md: reports/E5_model_compare_drift_summary.md

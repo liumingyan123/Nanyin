@@ -52,7 +52,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # ---- 导入自定义模块 ----
-from models import NanyinBoYaTCN
+from models import NanyinBoYaTCN, NanyinMusicMamba
 from loss_nanyin import nanyin_total_loss
 from loss_nanyin import (
     pitch_accuracy_MSE,
@@ -1103,12 +1103,16 @@ def train_compound(
     checkpoint_dir: Optional[str] = None,
     patience: Optional[int] = None,
     config_path: Optional[str] = None,
+    model_name: str = "boyatcn",
 ) -> Dict[str, Any]:
     """E2/E3 复合事件窗口训练主流程（加权三路 CE + 可选分布损失 + 早停 best-val）。
 
     参数:
         config_path: E3 新增。覆盖层 YAML 路径（如 configs/e3_L2.yaml）；
                      None 时沿用 E2 配置 configs/e2_compound_window.yaml（纯三路 CE）。
+        model_name:  E5 新增。"boyatcn"（默认，与 E2/E3 逐位一致）或 "musicmamba"。
+                     二者均为三路复合事件输出头，数据/损失/早停口径完全相同，
+                     用于 E5 任务A 的公平对比（唯一的自变量是骨干网络结构）。
     """
     cfg = load_config(config_path if config_path is not None else E2_CONFIG_PATH)
     tcfg = cfg["training"]
@@ -1120,9 +1124,23 @@ def train_compound(
     seed = int(seed if seed is not None else cfg["experiment"]["seed"])
     patience = int(patience if patience is not None else tcfg["early_stop_patience"])
 
+    model_key = str(model_name).lower()
+    if model_key not in ("boyatcn", "musicmamba"):
+        raise ValueError(f"[train_boyatcn] 未知 model_name={model_name!r}（可选 boyatcn / musicmamba）")
+    # E5：非默认模型时给输出文件名加后缀 → 不覆盖 E2/E3 既有产物
+    out_suffix = "" if model_key == "boyatcn" else f"_{model_key}"
+
     def _fmt(p: Optional[str]) -> Optional[str]:
         """路径模板：把 {seed} 替换为当前随机种子（E3 多籽实验用）。"""
         return p.replace("{seed}", str(seed)) if isinstance(p, str) else p
+
+    def _fmt_out(p: Optional[str]) -> Optional[str]:
+        """输出文件路径：`{seed}` 替换 + 文件名追加模型后缀（boyatcn 时为空 → 逐位不变）。"""
+        s = _fmt(p)
+        if s is None or not out_suffix:
+            return s
+        root, ext = os.path.splitext(s)
+        return root + out_suffix + ext
 
     checkpoint_dir = _fmt(checkpoint_dir if checkpoint_dir is not None else tcfg["checkpoint_dir"])
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -1142,15 +1160,15 @@ def train_compound(
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    log_path = _fmt(outcfg["log_file"])
-    csv_path = _fmt(outcfg["csv_file"])
+    log_path = _fmt_out(outcfg["log_file"])
+    csv_path = _fmt_out(outcfg["csv_file"])
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     log_lines: List[str] = []
     fh = open(log_path, "w", encoding="utf-8")
 
     stage = cfg["experiment"].get("name", "E2_compound_window")
     _e2_log(log_lines, "=" * 74, fh)
-    _e2_log(log_lines, f"{stage} — 复合事件窗口训练 BoYaTCN（分支 {cfg['experiment']['branch']}，"
+    _e2_log(log_lines, f"{stage} — 复合事件窗口训练 {model_key}（分支 {cfg['experiment']['branch']}，"
                        f"配置 {config_path or E2_CONFIG_PATH}）", fh)
     _e2_log(log_lines, "=" * 74, fh)
     _e2_log(log_lines, f"设备={device}, seed={seed}, epochs={num_epochs}, batch_size={batch_size}, "
@@ -1244,7 +1262,8 @@ def train_compound(
     )
 
     # ---------------- 模型 ----------------
-    model = NanyinBoYaTCN().to(device)
+    # E5：唯一自变量是骨干网络；两者三路输出头结构一致，词表/数据/损失完全相同
+    model = (NanyinBoYaTCN() if model_key == "boyatcn" else NanyinMusicMamba()).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=learning_rate, weight_decay=float(tcfg["weight_decay"])
     )
@@ -1252,7 +1271,7 @@ def train_compound(
         optimizer, step_size=int(tcfg["lr_step_size"]), gamma=float(tcfg["lr_gamma"])
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    _e2_log(log_lines, f"\n[模型] NanyinBoYaTCN 可训练参数 {n_params:,}", fh)
+    _e2_log(log_lines, f"\n[模型] {model_key}（{type(model).__name__}）可训练参数 {n_params:,}", fh)
 
     # ---------------- 训练循环 ----------------
     history: List[Dict[str, Any]] = []
@@ -1404,7 +1423,7 @@ def train_compound(
     _e2_log(log_lines, f"  完整训练日志: {log_path}", fh)
 
     # ---- 训练结束绘制损失曲线（E3 硬性要求：每组一张 PNG）----
-    curve_png = _fmt(outcfg.get("loss_curve_png"))
+    curve_png = _fmt_out(outcfg.get("loss_curve_png"))
     if curve_png:
         try:
             import plot_loss_curve
@@ -1439,7 +1458,9 @@ def train_compound(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="BoYaTCN 训练脚本")
+    parser = argparse.ArgumentParser(description="南音复合事件训练脚本（BoYaTCN / MusicMamba）")
+    parser.add_argument("--model", type=str, default="boyatcn", choices=["boyatcn", "musicmamba"],
+                        help="compound 模式下使用的骨干网络（E5 公平对比用；默认 boyatcn）")
     parser.add_argument("--mode", type=str, default="noef", choices=["noef", "compound"],
                         help="noef=E0/exp 主线整曲训练（默认）；compound=E2 复合事件窗口训练")
     parser.add_argument("--epochs", type=int, default=None)
@@ -1465,6 +1486,7 @@ if __name__ == "__main__":
             checkpoint_dir=args.checkpoint_dir,
             patience=args.patience,
             config_path=args.config,
+            model_name=args.model,
         )
         print(f"\n完成：最优验证 total loss={result['best_val_loss']:.4f} "
               f"@ epoch {result['best_epoch']}；checkpoint: {result['best_ckpt']}")

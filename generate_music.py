@@ -808,6 +808,263 @@ def run_sampling_search(
 
 
 # ==============================================================================
+# 五·之三、E5：模型公平对比 + 自回归误差累积漂移（固定权重 × 固定采样 × 多续写长度）
+# ==============================================================================
+#
+# ⚠ E5 硬性约束（写在此处以免后续误改）：
+#   1. 推理阶段不做任何训练 / 微调 / 权重修改，只加载 best-val 早停 checkpoint
+#      （BoYaTCN 取 E3-L3 三籽；MusicMamba 取 E5 前置子阶段同等条件补训的三籽）；
+#   2. 采样超参**全局固定**：temperature=1.0, top_p=0.95, top_k=0（E4 综合最优配置）；
+#      本阶段的自变量是「模型」与「续写长度」，采样不再是变量；
+#   3. prompt 规则固定：每窗口前 16 个 GT 事件，自回归续写到 target_len（**总长度**）；
+#      评估时跳过前 16 个 prompt，仅统计续写片段；
+#   4. 禁止任何 MIDI 后处理 / 时值钳位修正，评估使用模型原生输出；
+#   5. 每条序列的随机流由独立 torch.Generator 决定，种子按确定性公式计算 → 可复现。
+# ==============================================================================
+
+E5_DEFAULT_CONFIG: str = os.path.join(_SCRIPT_DIR, "configs", "e5_model_drift.yaml")
+
+
+def build_drift_midi_name(song_id: str, window_index: int, model_name: str,
+                          model_seed: int, target_len: int) -> str:
+    """E5 生成产物命名：{song_id}_w{窗口号}_{modelname}_seed{seed}_len{target_len}.mid"""
+    return f"{song_id}_w{window_index}_{model_name}_seed{model_seed}_len{target_len}.mid"
+
+
+def resolve_e5_models(cfg: dict, model_names: Optional[Sequence[str]] = None
+                      ) -> List[Tuple[str, Dict[str, Any]]]:
+    """返回 [(model_name, model_cfg)]，只保留 enabled=true 且被选中的模型。"""
+    all_models = cfg["models"]
+    picked = list(model_names) if model_names else list(all_models.keys())
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    for name in picked:
+        mcfg = all_models[name]
+        if not bool(mcfg.get("enabled", True)):
+            continue
+        out.append((name, mcfg))
+    return out
+
+
+def load_e5_model(model_name: str, ckpt_path: str, device: torch.device,
+                  strict: bool = True) -> torch.nn.Module:
+    """按模型名加载 best-val 权重（BoYaTCN / MusicMamba 三路输出头结构一致）。"""
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"[E5] 权重文件不存在: {ckpt_path}")
+    cls = NanyinBoYaTCN if str(model_name).lower() == "boyatcn" else NanyinMusicMamba
+    model = cls().to(device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
+    model.eval()
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[E5] 已加载权重: {model_name}({cls.__name__}, {n_params:,} 参数) ← {ckpt_path} "
+          f"(epoch={checkpoint.get('epoch', '?')}, "
+          f"val_loss={checkpoint.get('val_loss', float('nan')):.4f})")
+    return model
+
+
+def run_model_drift_generation(
+    cfg: Optional[dict] = None,
+    model_names: Optional[Sequence[str]] = None,
+    model_seeds: Optional[Dict[str, Sequence[int]]] = None,
+    target_lens: Optional[Sequence[int]] = None,
+    device: Optional[torch.device] = None,
+    overwrite: bool = False,
+    write_csv: bool = True,
+) -> Dict[str, Any]:
+    """E5 主流程：(模型 × 训练种子 × 续写长度 × 10 个验证窗口) → MIDI + 事件流水 + 清单 CSV。
+
+    参数:
+        cfg:         E5 配置字典（None 时读 configs/e5_model_drift.yaml）
+        model_names: 覆盖待跑模型名列表
+        model_seeds: {model_name: [seed, ...]} 覆盖种子列表
+        target_lens: 覆盖续写长度列表（**总长度**，含 16 个 prompt 事件）
+        device:      推理设备
+        overwrite:   已存在的 MIDI 也重新生成
+        write_csv:   是否写清单 CSV（单元测试做短序列冒烟时可为 False）
+    返回:
+        {"num_generated": int, "csv": str, "midi_dir": str, "events_jsonl": str}
+    """
+    cfg = cfg if cfg is not None else load_config(E5_DEFAULT_CONFIG)
+    wcfg = cfg["window"]
+    scfg = cfg["sampling"]
+    outcfg = cfg["outputs"]
+
+    temperatures = float(scfg["temperature"])
+    top_p = float(scfg["top_p"])
+    top_k_map = dict(scfg["top_k"])
+    prompt_len = int(wcfg["prompt_len_events"])
+    lens = list(target_lens) if target_lens is not None else list(wcfg["target_len_events_list"])
+    prepend_bos = bool(wcfg.get("prepend_bos", True))
+    rng_base = int(scfg["rng_base_seed"])
+    seed_slot = int(scfg.get("seed_slot", 97))
+
+    # 后处理开关：E5 强制全部关闭（这里做一次断言，防止配置被误改）
+    for _k, _v in dict(cfg["postprocess"]).items():
+        if bool(_v):
+            raise ValueError(f"[E5] postprocess.{_k} 必须为 false（E5 评估使用原生输出）")
+
+    models = resolve_e5_models(cfg, model_names)
+
+    midi_dir = os.path.join(_SCRIPT_DIR, str(outcfg["midi_dir"]))
+    csv_path = os.path.join(_SCRIPT_DIR, str(outcfg["generate_list_csv"]))
+    events_jsonl = os.path.join(_SCRIPT_DIR, str(outcfg.get("events_jsonl", "results/e5/e5_events.jsonl")))
+    os.makedirs(midi_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(events_jsonl) or ".", exist_ok=True)
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    total = sum(len((model_seeds or {}).get(n, mcfg["model_seeds"])) * len(lens) * 10
+                for n, mcfg in models)
+    print("=" * 70)
+    print("E5: 固定权重 + 固定采样(T/p/k) → 模型对比 × 自回归漂移")
+    print("=" * 70)
+    print(f"  推理设备      : {device}")
+    print(f"  模型          : {[n for n, _ in models]}")
+    print(f"  采样(固定)    : temperature={temperatures:g}, top_p={top_p:g}, top_k={top_k_map}")
+    print(f"  prompt 规则   : 每窗口前 {prompt_len} 个 GT 事件")
+    print(f"  续写长度      : {lens}（总长度口径：含 prompt）")
+    print(f"  预计序列数    : {total}（模型×种子×长度×10 窗口）")
+    print(f"  后处理        : 全部关闭（原生输出）")
+    print(f"  MIDI 输出目录 : {midi_dir}")
+
+    windows = load_val_windows(cfg, verbose=True)
+
+    if not overwrite:
+        with open(events_jsonl, "w", encoding="utf-8") as f:
+            pass
+
+    done_keys = set()
+    if os.path.exists(events_jsonl):
+        with open(events_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    done_keys.add((
+                        rec["model_name"], rec["song_id"], int(rec["window_index"]),
+                        int(rec["model_seed"]), int(rec["target_len"]),
+                    ))
+                except json.JSONDecodeError:
+                    continue
+    if done_keys:
+        print(f"[E5] 已存在 {len(done_keys)} 条事件记录 → 跳过（overwrite={overwrite}）")
+
+    if write_csv:
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow([
+                "song_id", "window_index", "window_start_event", "window_end_event",
+                "model_name", "model_seed", "checkpoint",
+                "temperature", "top_p", "top_k_pitch", "top_k_duration", "top_k_shift",
+                "rng_seed", "prompt_len", "target_len", "num_events",
+                "output_midi_path",
+            ])
+
+    generated = 0
+    t_start = time.time()
+
+    for model_name, mcfg in models:
+        seeds = list(model_seeds[model_name]) if (model_seeds and model_name in model_seeds) \
+            else list(mcfg["model_seeds"])
+
+        for model_seed in seeds:
+            ckpt_path = mcfg["checkpoint_template"].format(seed=model_seed)
+            model = load_e5_model(model_name, ckpt_path, device,
+                                  strict=bool(mcfg.get("strict_load", True)))
+
+            for l_i, target_len in enumerate(lens):
+                rows: List[List[Any]] = []
+                event_records: List[Dict[str, Any]] = []
+                for win in windows:
+                    fname = build_drift_midi_name(
+                        win["song_id"], win["window_index"], model_name,
+                        model_seed, target_len,
+                    )
+                    midi_path = os.path.join(midi_dir, fname)
+                    rng = _rng_seed(rng_base, model_seed, l_i, win["window_index"],
+                                    seed_slot=seed_slot)
+                    cache_key = (model_name, win["song_id"], int(win["window_index"]),
+                                 int(model_seed), int(target_len))
+                    if overwrite or (cache_key not in done_keys):
+                        gen = torch.Generator(device=device.type)
+                        gen.manual_seed(rng)
+                        events = generate_compound_autoregressive(
+                            model=model,
+                            prompt_pitch_ids=win["pitch_ids"][:prompt_len],
+                            prompt_duration_ids=win["duration_ids"][:prompt_len],
+                            prompt_shift_ids=win["shift_ids"][:prompt_len],
+                            target_len=int(target_len),
+                            device=device,
+                            codec=CODEC,
+                            temperature=temperatures,
+                            top_p=top_p,
+                            top_k=top_k_map,
+                            generator=gen,
+                            prepend_bos=prepend_bos,
+                        )
+                        # ---- 原生输出直写 MIDI：**无任何后处理 / 钳位** ----
+                        notes = events_to_notes(
+                            events["pitch_ids"], events["duration_ids"],
+                            events["shift_ids"], codec=CODEC,
+                        )
+                        notes_to_midi(
+                            notes, output_path=midi_path,
+                            velocities=compute_velocities(len(notes)),
+                        )
+                        event_records.append({
+                            "model_name": model_name,
+                            "song_id": win["song_id"],
+                            "window_index": win["window_index"],
+                            "model_seed": int(model_seed),
+                            "temperature": float(temperatures),
+                            "top_p": float(top_p),
+                            "rng_seed": int(rng),
+                            "prompt_len": prompt_len,
+                            "target_len": int(target_len),
+                            "pitch_ids": list(events["pitch_ids"]),
+                            "duration_ids": list(events["duration_ids"]),
+                            "shift_ids": list(events["shift_ids"]),
+                            "midi_path": midi_path,
+                        })
+                        done_keys.add(cache_key)
+
+                    rows.append([
+                        win["song_id"], win["window_index"], win["start"], win["end"],
+                        model_name, model_seed, ckpt_path,
+                        temperatures, top_p,
+                        top_k_map.get("pitch", 0), top_k_map.get("duration", 0),
+                        top_k_map.get("shift", 0),
+                        rng, prompt_len, int(target_len), int(target_len), midi_path,
+                    ])
+
+                if write_csv:
+                    with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
+                        csv.writer(f).writerows(rows)
+                if event_records:
+                    with open(events_jsonl, "a", encoding="utf-8") as f:
+                        for rec in event_records:
+                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                generated += len(rows)
+                print(f"[E5] {model_name} seed={model_seed} len={target_len} → "
+                      f"{len(rows)} 条")
+
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    elapsed = time.time() - t_start
+    print(f"\n[E5] 生成完成: {generated} 条序列，耗时 {elapsed / 60:.1f} 分钟")
+    if write_csv:
+        print(f"  清单 CSV  : {csv_path}")
+    print(f"  事件流水  : {events_jsonl}")
+    return {"num_generated": generated, "csv": csv_path,
+            "midi_dir": midi_dir, "events_jsonl": events_jsonl}
+
+
+# ==============================================================================
 # 六、主流程：批量生成
 # ==============================================================================
 
@@ -966,9 +1223,12 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """命令行入口参数。"""
     parser = argparse.ArgumentParser(description="南音符号旋律推理生成")
     parser.add_argument(
-        "--mode", default="default", choices=["default", "sampling_search"],
-        help="default = E1 批量生成；sampling_search = E4 temperature/top-p 网格搜索",
+        "--mode", default="default", choices=["default", "sampling_search", "model_drift"],
+        help="default = E1 批量生成；sampling_search = E4 temperature/top-p 网格搜索；"
+             "model_drift = E5 模型对比 × 自回归漂移（固定 T/p/k）",
     )
+    parser.add_argument("--models", default=None, help="模型名列表，逗号分隔（E5 覆盖配置）")
+    parser.add_argument("--lengths", default=None, help="续写长度列表，逗号分隔（E5 覆盖配置）")
     parser.add_argument(
         "--config", default=None,
         help="覆盖层 YAML 路径（默认 default 模式不读；sampling_search 默认 configs/e4_sampling_search.yaml）",
@@ -1005,5 +1265,15 @@ if __name__ == "__main__":
             cfg=cfg, model_seeds=seeds, temperature_grid=temps,
             top_p_grid=topps, overwrite=args.overwrite,
         )
+    elif args.mode == "model_drift":
+        cfg = load_config(args.config) if args.config else load_config(E5_DEFAULT_CONFIG)
+        models = [s.strip() for s in args.models.split(",")] if args.models else None
+        lens = [int(s) for s in args.lengths.split(",")] if args.lengths else None
+        seeds_map = None
+        if args.seeds:
+            given = [int(s) for s in args.seeds.split(",")]
+            seeds_map = {n: given for n, _ in resolve_e5_models(cfg, models)}
+        run_model_drift_generation(cfg=cfg, model_names=models, model_seeds=seeds_map,
+                                   target_lens=lens, overwrite=args.overwrite)
     else:
         main()

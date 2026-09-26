@@ -46,6 +46,7 @@ from symbolic_features import (                                   # noqa: E402
 )
 
 E4_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "configs", "e4_sampling_search.yaml")
+E5_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "configs", "e5_model_drift.yaml")
 
 # 窗口 GT 的调式 pitch-class 集合缓存：{(song_id, window_index): List[int]}
 _MODE_PCS_CACHE: Dict[Tuple[str, int], List[int]] = {}
@@ -380,6 +381,386 @@ def evaluate_all(cfg: dict) -> Dict[str, Any]:
     return result
 
 
+# ==============================================================================
+# E5：任务A/B/C（模型公平对比 × 自回归漂移 × 46 维降维）
+# ==============================================================================
+# ⚠ 说明：以下为 E5 新增段落，E4 的 `evaluate_all` / `_heatmap` / 主流程 e4 分支
+#   逻辑逐字未改（通过 `--stage` 选择分支），保证 E4 可复现性不受影响。
+# ⚠ E5 硬性约束：评估使用模型**原生输出**（无后处理 / 无钳位）；不训练不改权重；
+#   所有指标基于真实推理输出，异常现象如实记录。
+# ==============================================================================
+
+def _gt_region_features(gt: Dict[str, Any], skip_prompt: int, target_len: int,
+                        mode_pcs: Sequence[int]) -> np.ndarray:
+    """GT 的**等长评估区域** 46 维特征：tokens[skip_prompt:target_len]。
+
+    与生成片段同起点、同长度 → 不同续写长度下的 gtDist 可比。
+    """
+    end = int(target_len)
+    return extract_symbolic_features(
+        gt["tokens"][skip_prompt:end], gt["durations"][skip_prompt:end],
+        gt["starts"][skip_prompt:end], mode_pcs=mode_pcs,
+    )
+
+
+def _eval_one_record(
+    rec: Dict[str, Any], gt: Dict[str, Any], cfg: dict, codec: CompoundEventCodec,
+) -> Tuple[Dict[str, Any], np.ndarray]:
+    """对一条 E5 生成记录做 Tier-1 评估，返回 (row, feat46)。"""
+    ecfg = cfg["evaluation"]
+    skip_prompt = int(ecfg["skip_prompt"])
+    ngram = int(ecfg["repetition"]["ngram"])
+
+    p_ids = list(rec["pitch_ids"])
+    d_ids = list(rec["duration_ids"])
+    s_ids = list(rec["shift_ids"])
+
+    gen_tokens = [int(x) for x in p_ids]
+    gen_durations = [codec.index_to_duration(int(x)) for x in d_ids]
+    gen_starts = _cumulative_starts(s_ids, codec)
+
+    # 原生输出直评：**不做任何后处理 / 钳位**
+    metrics = evaluate_single_song(
+        gen_tokens, gen_durations, gt,
+        skip_prompt=skip_prompt, gen_starts=gen_starts,
+    )
+    composite = compute_composite_score(metrics)
+
+    ill = _illegal_stats(p_ids[skip_prompt:], d_ids[skip_prompt:], s_ids[skip_prompt:],
+                         ecfg["illegal"])
+    rep = _ngram_repetition_rate(p_ids[skip_prompt:], ngram)
+
+    feat = extract_symbolic_features(
+        [int(x) for x in p_ids[skip_prompt:]],
+        [codec.index_to_duration(int(x)) for x in d_ids[skip_prompt:]],
+        gen_starts[skip_prompt:],
+        mode_pcs=_MODE_PCS_CACHE[(rec["song_id"], int(rec["window_index"]))],
+    )
+
+    row = {
+        "song_id": rec["song_id"],
+        "window_index": int(rec["window_index"]),
+        "model_name": rec["model_name"],
+        "model_seed": int(rec["model_seed"]),
+        "target_len": int(rec["target_len"]),
+        "rng_seed": int(rec.get("rng_seed", -1)),
+        "composite": composite,
+        "pitch_accuracy": metrics.get("pitch_accuracy", 0.0),
+        "pitch_stability": metrics.get("pitch_stability", 0.0),
+        "transition_smoothness": metrics.get("transition_smoothness", 0.0),
+        "melody_coherence": metrics.get("melody_coherence", 0.0),
+        "rhythm_consistency": metrics.get("rhythm_consistency", 0.0),
+        "tempo_accuracy": metrics.get("tempo_accuracy", 0.0),
+        "ornament_score": metrics.get("ornament_score", 0.0),
+        "ornament_density": metrics.get("ornament_density", 0.0),
+        "mode_matching_score": metrics.get("mode_matching_score", 0.0),
+        "melody_cosine_similarity": metrics.get("melody_cosine_similarity", 0.0),
+        **ill,
+        "repetition_rate": rep,
+        "midi_path": rec.get("midi_path", ""),
+    }
+    return row, feat
+
+
+def evaluate_all_e5(cfg: dict) -> Dict[str, Any]:
+    """E5 主评估：逐条 Tier-1 → 明细 CSV → (模型 × 续写长度) 聚合 → 任务C 样本集合。
+
+    返回 dict（含内存中的 `_samples` 供降维使用，写 JSON 前会剔除）。
+    """
+    outcfg = cfg["outputs"]
+    ecfg = cfg["evaluation"]
+    skip_prompt = int(ecfg["skip_prompt"])
+    codec = get_compound_codec(cfg)
+
+    rows_csv = os.path.join(_SCRIPT_DIR, str(outcfg["eval_rows_csv"]))
+    summary_csv = os.path.join(_SCRIPT_DIR, str(outcfg["eval_summary_csv"]))
+    summary_json = os.path.join(_SCRIPT_DIR, str(outcfg["eval_summary_json"]))
+    for p in (rows_csv, summary_csv, summary_json):
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+
+    events_path = os.path.join(_SCRIPT_DIR, str(outcfg["events_jsonl"]))
+    records = _read_jsonl(events_path)
+    gt_map = build_window_gt(cfg)
+
+    _MODE_PCS_CACHE.clear()
+    for key, gt in gt_map.items():
+        _MODE_PCS_CACHE[key] = resolve_mode_pcs(gt["mode_key"])
+    print(f"[E5-eval] 原始序列 {len(records)} 条；窗口 GT {len(gt_map)} 个")
+
+    # ---- GT 天花板（GT vs 自身，不跳过 prompt）----
+    gt_ceiling = []
+    for key, gt in gt_map.items():
+        m = evaluate_single_song(
+            gt["tokens"], gt["durations"], gt,
+            skip_prompt=int(ecfg["gt_ceiling_skip_prompt"]), gen_starts=gt["starts"],
+        )
+        m["composite"] = compute_composite_score(m)
+        gt_ceiling.append({"song_id": key[0], "window_index": key[1], **m})
+    gt_ceiling_vals = [r["composite"] for r in gt_ceiling]
+
+    # ---- 逐条评估 ----
+    rows: List[Dict[str, Any]] = []
+    feats: List[np.ndarray] = []
+    for rec in records:
+        key = (rec["song_id"], int(rec["window_index"]))
+        gt = gt_map[key]
+        row, feat = _eval_one_record(rec, gt, cfg, codec)
+        # gtDist：与生成片段**等长、同起点**的 GT 区域
+        gt_feat = _gt_region_features(gt, skip_prompt, int(rec["target_len"]),
+                                      _MODE_PCS_CACHE[key])
+        row["gt_feature_distance"] = float(np.linalg.norm(feat - gt_feat))
+        rows.append(row)
+        feats.append(feat)
+
+    print(f"[E5-eval] GT 天花板 composite = {np.mean(gt_ceiling_vals):.2f} "
+          f"± {np.std(gt_ceiling_vals):.2f}")
+
+    # ---- 明细 CSV ----
+    feat_cols = [f"feat_{i:02d}" for i in range(FEATURE_DIM)]
+    base_cols = [
+        "song_id", "window_index", "model_name", "model_seed", "target_len", "rng_seed",
+        "composite", "pitch_accuracy", "pitch_stability", "transition_smoothness",
+        "melody_coherence", "rhythm_consistency", "tempo_accuracy",
+        "ornament_score", "ornament_density", "mode_matching_score",
+        "melody_cosine_similarity",
+        "illegal_pitch_count", "illegal_duration_count", "illegal_shift_count",
+        "illegal_pitch_rate", "illegal_duration_rate", "illegal_shift_rate",
+        "illegal_total_rate", "repetition_rate", "gt_feature_distance", "midi_path",
+    ]
+    for r, feat in zip(rows, feats):
+        for i, v in enumerate(feat):
+            r[f"feat_{i:02d}"] = float(v)
+    with open(rows_csv, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=base_cols + feat_cols)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"[E5-eval] 明细: {rows_csv}")
+
+    # ---- 按 (模型, 续写长度) 聚合 ----
+    model_names = sorted({r["model_name"] for r in rows})
+    lens = sorted({int(r["target_len"]) for r in rows})
+    metric_cols = [c for c in base_cols if c not in (
+        "song_id", "window_index", "model_name", "model_seed", "target_len",
+        "rng_seed", "midi_path",
+    )]
+
+    summary_rows: List[Dict[str, Any]] = []
+    for m in model_names:
+        for L in lens:
+            sub = [r for r in rows if r["model_name"] == m and int(r["target_len"]) == L]
+            if not sub:
+                continue
+            agg: Dict[str, Any] = {"model_name": m, "target_len": L, "n_samples": len(sub)}
+            for c in metric_cols:
+                vals = np.asarray([r[c] for r in sub], dtype=np.float64)
+                agg[f"{c}_mean"] = float(vals.mean())
+                agg[f"{c}_std"] = float(vals.std(ddof=0))
+            # 跨训练种子多样性：同 (模型, 长度, 窗口) 下 3 个种子的 46 维特征两两距离
+            seed_div: List[float] = []
+            for r_i, row_i in enumerate(rows):
+                if row_i["model_name"] != m or int(row_i["target_len"]) != L:
+                    continue
+                peers = [j for j, r_j in enumerate(rows)
+                         if j != r_i and r_j["model_name"] == m
+                         and int(r_j["target_len"]) == L
+                         and r_j["song_id"] == row_i["song_id"]
+                         and int(r_j["window_index"]) == int(row_i["window_index"])]
+                if peers:
+                    mat = pairwise_distance_matrix([feats[r_i]] + [feats[j] for j in peers])
+                    seed_div.append(float(np.mean(mat[0, 1:])))
+            agg["cross_seed_diversity_mean"] = float(np.mean(seed_div)) if seed_div else 0.0
+            summary_rows.append(agg)
+
+    summary_cols = ["model_name", "target_len", "n_samples"] + [
+        f"{c}_{k}" for c in metric_cols for k in ("mean", "std")
+    ] + ["cross_seed_diversity_mean"]
+    with open(summary_csv, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=summary_cols)
+        w.writeheader()
+        for agg in summary_rows:
+            w.writerow(agg)
+    print(f"[E5-eval] 聚合: {summary_csv}")
+
+    # ---- 任务C 降维样本集合（仅续写片段的 46 维特征）----
+    samples: List[Dict[str, Any]] = []
+    for r, feat in zip(rows, feats):
+        samples.append({
+            "feat": feat, "source": r["model_name"], "group": str(int(r["target_len"])),
+            "seed": int(r["model_seed"]), "song_id": r["song_id"],
+            "window_index": int(r["window_index"]),
+        })
+    for key, gt in gt_map.items():
+        for L in lens:
+            samples.append({
+                "feat": _gt_region_features(gt, skip_prompt, int(L), _MODE_PCS_CACHE[key]),
+                "source": "GT", "group": str(int(L)), "seed": -1,
+                "song_id": key[0], "window_index": key[1],
+            })
+
+    result: Dict[str, Any] = {
+        "config_paths": {
+            "rows_csv": rows_csv, "summary_csv": summary_csv, "summary_json": summary_json,
+        },
+        "num_records": len(records),
+        "models": model_names,
+        "lengths": lens,
+        "gt_ceiling": {
+            "composite_mean": float(np.mean(gt_ceiling_vals)),
+            "composite_std": float(np.std(gt_ceiling_vals)),
+            "per_window": gt_ceiling,
+        },
+        "summary": summary_rows,
+        "_samples": samples,      # 内存数据，写 JSON 前剔除
+    }
+    return result
+
+
+def _plot_drift_lines(result: Dict[str, Any], cfg: dict) -> None:
+    """任务B：随续写长度 32→64→128→256 的指标漂移折线图（4 面板）。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = cfg["outputs"]
+    lens = [int(x) for x in result["lengths"]]
+    models = list(result["models"])
+    rows = result["summary"]
+
+    specs = [
+        ("composite_mean", "composite_std", "Composite score (Tier-1)"),
+        ("gt_feature_distance_mean", "gt_feature_distance_std",
+         "46-dim feature distance to same-length GT"),
+        ("repetition_rate_mean", "repetition_rate_std", "4-gram repetition rate"),
+        ("illegal_total_rate_mean", "illegal_total_rate_std", "Illegal token rate"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 8.0), dpi=160)
+    for ax, (mkey, skey, title) in zip(axes.ravel(), specs):
+        for model_name in models:
+            xs, ys, es = [], [], []
+            for L in lens:
+                hit = [r for r in rows if r["model_name"] == model_name
+                       and int(r["target_len"]) == L]
+                if not hit:
+                    continue
+                xs.append(L)
+                ys.append(float(hit[0][mkey]))
+                es.append(float(hit[0][skey]))
+            ax.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=model_name)
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(lens, [str(l) for l in lens])
+        ax.set_xlabel("target sequence length (events, incl. 16 prompt)")
+        ax.set_title(title, fontsize=10)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=9)
+    fig.suptitle("E5 Task B - autoregressive drift vs continuation length "
+                 "(mean +/- std over 3 seeds x 10 val windows)", fontsize=11)
+    fig.tight_layout()
+    path = os.path.join(_SCRIPT_DIR, str(out["drift_line_png"]))
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"[E5-eval] 漂移折线图: {path}")
+
+
+def _cluster_info(samples: List[Dict[str, Any]], xy: np.ndarray,
+                  tag: str) -> List[Dict[str, Any]]:
+    """各类簇中心 + 到**同长度 GT 簇中心**的距离（降维空间，仅作定性参考）。"""
+    info: List[Dict[str, Any]] = []
+    gt_center: Dict[str, np.ndarray] = {}
+    for grp in sorted({s["group"] for s in samples}):
+        idx = [i for i, s in enumerate(samples) if s["source"] == "GT" and s["group"] == grp]
+        if idx:
+            gt_center[grp] = xy[idx].mean(axis=0)
+    for source in sorted({s["source"] for s in samples if s["source"] != "GT"}):
+        for grp in sorted({s["group"] for s in samples if s["source"] == source}):
+            idx = [i for i, s in enumerate(samples)
+                   if s["source"] == source and s["group"] == grp]
+            if not idx:
+                continue
+            center = xy[idx].mean(axis=0)
+            dist = (float(np.linalg.norm(center - gt_center[grp]))
+                    if grp in gt_center else float("nan"))
+            spread = float(np.mean(np.linalg.norm(xy[idx] - center, axis=1)))
+            info.append({
+                "method": tag, "source": source, "length": int(grp), "n_samples": len(idx),
+                "center_x": float(center[0]), "center_y": float(center[1]),
+                "dist_to_gt_center": dist, "within_cluster_spread": spread,
+            })
+    return info
+
+
+def _plot_reduction(result: Dict[str, Any], cfg: dict) -> List[Dict[str, Any]]:
+    """任务C：46 维符号特征 → StandardScaler → UMAP / t-SNE。
+
+    超参严格按 exp3 口径：UMAP(n_neighbors=8, min_dist=0.1, random_state=42)、
+    t-SNE(perplexity=5, max_iter=2000, init=pca, random_state=42)。
+    样本：10 个验证窗口 GT（同起点等长截取）+ 两组模型 × 3 种子 × 4 长度 × 10 窗口。
+    ⚠ 禁止混入 exp3 旧 NOEF 单 token 样本（事件表示不同，特征空间不兼容）。
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.manifold import TSNE
+    from umap import UMAP
+
+    out = cfg["outputs"]
+    rcfg = cfg["reduction"]
+    samples: List[Dict[str, Any]] = result["_samples"]
+    X = np.asarray([np.asarray(s["feat"], dtype=np.float64) for s in samples])
+    Xs = StandardScaler().fit_transform(X)
+    print(f"[E5-eval] 任务C 样本数 = {len(samples)}（含同起点等长 GT 区域）")
+
+    colors = {"GT": "#444444", "boyatcn": "#1f77b4", "musicmamba": "#ff7f0e"}
+    markers = {"32": "o", "64": "s", "128": "^", "256": "D"}
+    u = rcfg["umap"]
+    t = rcfg["tsne"]
+
+    uu = UMAP(n_neighbors=int(u["n_neighbors"]), min_dist=float(u["min_dist"]),
+              n_components=2, random_state=int(u["random_state"]), n_jobs=1)
+    xy_u = uu.fit_transform(Xs)
+    tt = TSNE(n_components=2, perplexity=float(t["perplexity"]),
+              max_iter=int(t["max_iter"]), init=str(t["init"]),
+              random_state=int(t["random_state"]))
+    xy_t = tt.fit_transform(Xs)
+
+    def _draw(xy: np.ndarray, title: str, path: str) -> None:
+        fig, ax = plt.subplots(figsize=(8.0, 6.4), dpi=160)
+        for source in ("GT", "boyatcn", "musicmamba"):
+            for grp in sorted({s["group"] for s in samples}):
+                idx = [i for i, s in enumerate(samples)
+                       if s["source"] == source and s["group"] == grp]
+                if not idx:
+                    continue
+                ax.scatter(xy[idx, 0], xy[idx, 1],
+                           s=26 if source != "GT" else 46,
+                           c=colors[source], marker=markers.get(grp, "o"),
+                           alpha=0.85 if source != "GT" else 0.95,
+                           edgecolors="white" if source == "GT" else "none",
+                           linewidths=0.6, label=f"{source} len={grp}")
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("dim 1")
+        ax.set_ylabel("dim 2")
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=7, ncol=3, loc="best")
+        fig.tight_layout()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fig.savefig(path)
+        plt.close(fig)
+        print(f"[E5-eval] 降维图: {path}")
+
+    umap_png = os.path.join(_SCRIPT_DIR, str(out["umap_png"]))
+    tsne_png = os.path.join(_SCRIPT_DIR, str(out["tsne_png"]))
+    _draw(xy_u, "E5 Task C - UMAP of 46-dim symbolic features "
+                "(n_neighbors=8, min_dist=0.1, seed=42)", umap_png)
+    _draw(xy_t, "E5 Task C - t-SNE of 46-dim symbolic features "
+                "(perplexity=5, init=pca, max_iter=2000, seed=42)", tsne_png)
+
+    return _cluster_info(samples, xy_u, "umap") + _cluster_info(samples, xy_t, "tsne")
+
+
 def _heatmap(result: Dict[str, Any], cfg: dict) -> None:
     """绘制三张热力图：composite / 非法率 / 多样性（行=temperature，列=top-p）。"""
     import matplotlib
@@ -430,12 +811,28 @@ def _heatmap(result: Dict[str, Any], cfg: dict) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="E4 采样配置批量评估")
-    ap.add_argument("--config", default=E4_CONFIG_PATH, help="E4 配置 YAML")
-    ap.add_argument("--no-plot", action="store_true", help="跳过热力图绘制")
+    ap = argparse.ArgumentParser(description="E4 / E5 批量 Tier-1 评估")
+    ap.add_argument("--stage", default="e4", choices=["e4", "e5"],
+                    help="e4 = E4 采样网格评估（默认）；e5 = E5 模型对比与自回归漂移")
+    ap.add_argument("--config", default=None, help="配置 YAML（默认按 stage 选择）")
+    ap.add_argument("--no-plot", action="store_true", help="跳过绘图")
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config or (E4_CONFIG_PATH if args.stage == "e4" else E5_CONFIG_PATH))
+
+    if args.stage == "e5":
+        result = evaluate_all_e5(cfg)
+        if not args.no_plot:
+            _plot_drift_lines(result, cfg)
+            result["cluster_distance"] = _plot_reduction(result, cfg)
+        result.pop("_samples", None)          # 内存特征矩阵不落盘
+        json_path = os.path.join(_SCRIPT_DIR, str(cfg["outputs"]["eval_summary_json"]))
+        os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        print(f"[E5-eval] 聚合 JSON: {json_path}")
+        return 0
+
     result = evaluate_all(cfg)
     if not args.no_plot:
         _heatmap(result, cfg)
