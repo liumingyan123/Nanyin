@@ -81,6 +81,8 @@ DEFAULT_EXTERNAL_DIR = os.path.join(_SCRIPT_DIR, "古典曲")
 
 # 类别 → 视觉编码（颜色区分数据类别/模型，形状区分 GT 与生成模型）
 CATEGORY_ORDER = ["GT_train", "GT_val", "GT_external", "boyatcn", "musicmamba"]
+# 外部非南音曲目按曲目轮转取色（灰度/冷色系，与绿色 GT、蓝橙生成明显区分）
+EXT_PALETTE = ["#4F4F4F", "#8E24AA", "#9E9E9E", "#6D4C41", "#00838F", "#455A64"]
 STYLE = {
     "GT_train":    {"color": "#2E7D32", "marker": "o", "size": 78,  "edge": "black"},
     "GT_val":      {"color": "#7CB342", "marker": "o", "size": 110, "edge": "black"},
@@ -159,9 +161,33 @@ def _notes_from_midi(midi_path: str) -> list:
     """用 pretty_midi 解析任意 MIDI（含外部非南音曲目）→ 音符列表。
 
     与 dataset_nanyin.load_song_annotations 同口径：合并全部轨道音符，按 (start, pitch) 升序。
+    下载站 MIDI 偶有"数据字节越界"（data byte must be in range 0..127）等脏数据，
+    pretty_midi / mido 严格模式会直接抛错；此处退化为 mido(clip=True) 容错重序列化
+    后再交给 pretty_midi，保证与其他曲目走**完全相同**的后续编解码与特征口径。
     """
+    import tempfile
     import pretty_midi
-    pm = pretty_midi.PrettyMIDI(midi_path)
+
+    try:
+        pm = pretty_midi.PrettyMIDI(midi_path)
+    except Exception as e_pm:
+        try:
+            import mido
+            mid = mido.MidiFile(midi_path, clip=True)   # clip=True：越界数据字节截断到 0..127
+            tmp_dir = tempfile.mkdtemp(prefix="e5_vis_midi_")
+            tmp_mid = os.path.join(tmp_dir, "sanitized.mid")
+            mid.save(tmp_mid)
+            pm = pretty_midi.PrettyMIDI(tmp_mid)
+            print(f"[fullsong-vis] MIDI 存在脏数据({type(e_pm).__name__}: {e_pm})，"
+                  f"已用 mido(clip=True) 容错重解析: {os.path.basename(midi_path)}")
+        except ImportError:
+            raise RuntimeError(
+                f"[fullsong-vis] MIDI 解析失败且未安装 mido，无法容错处理: {midi_path}")
+        except Exception as e2:
+            raise RuntimeError(
+                f"[fullsong-vis] MIDI 容错解析仍失败: {midi_path} "
+                f"({type(e2).__name__}: {e2})")
+
     notes = []
     for inst in pm.instruments:
         for n in inst.notes:
@@ -326,27 +352,43 @@ def _draw(xy_gt: np.ndarray, xy_gen: np.ndarray, gt: list, gen: list,
     _use_cjk_font()
     fig, ax = plt.subplots(figsize=(9.6, 7.2), dpi=160)
 
-    by_cat = {}
+    def _group_key(s: dict) -> str:
+        """外部非南音按**曲目**拆色（便于观察不同外来曲目是否相互分离）。"""
+        if s["category"] == "GT_external":
+            return f"GT_external::{s['song_id']}"
+        return s["category"]
+
+    by_cat: dict = {}
     for i, s in enumerate(gt):
-        by_cat.setdefault(s["category"], []).append(("gt", i, s))
+        by_cat.setdefault(_group_key(s), []).append(("gt", i, s))
     for i, s in enumerate(gen):
         by_cat.setdefault(s["category"], []).append(("gen", i, s))
 
+    ext_keys = sorted(k for k in by_cat if k.startswith("GT_external::"))
+    ext_color = {k: EXT_PALETTE[i % len(EXT_PALETTE)] for i, k in enumerate(ext_keys)}
+    draw_order = ["GT_train", "GT_val"] + ext_keys + ["boyatcn", "musicmamba"]
+
     handles = []
-    for cat in CATEGORY_ORDER:
+    for cat in draw_order:
         items = by_cat.get(cat, [])
         if not items:
             continue
-        st = STYLE[cat]
+        if cat.startswith("GT_external::"):
+            st = STYLE["GT_external"]
+            color = ext_color[cat]
+            label = f"GT 外部非南音「{cat.split('::', 1)[1]}」(256 事件滑窗)  n={len(items)}"
+        else:
+            st = STYLE[cat]
+            color = st["color"]
+            label = f"{LABEL[cat]}  n={len(items)}"
         pts = [xy_gt[i] if kind == "gt" else xy_gen[i] for kind, i, _ in items]
         xy = np.asarray(pts)
-        ax.scatter(xy[:, 0], xy[:, 1], s=st["size"], c=st["color"],
+        ax.scatter(xy[:, 0], xy[:, 1], s=st["size"], c=color,
                    marker=st["marker"], alpha=0.9 if cat.startswith("GT") else 0.75,
                    edgecolors=st["edge"], linewidths=0.8 if cat.startswith("GT") else 0.5,
                    zorder=3 if cat.startswith("GT") else 2)
-        handles.append(Line2D([], [], marker=st["marker"], ls="", color=st["color"],
-                              markersize=9 if cat.startswith("GT") else 7,
-                              label=f"{LABEL[cat]}  n={len(items)}"))
+        handles.append(Line2D([], [], marker=st["marker"], ls="", color=color,
+                              markersize=9 if cat.startswith("GT") else 7, label=label))
 
         # 仅标注验证集 GT 滑窗（生成样本的来源曲目），避免图上文字过密
         if cat == "GT_val":
