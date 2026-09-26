@@ -1074,3 +1074,14 @@ len=128 的 MusicMamba 最散最远，与 §7.7 该长度 mode/composite 谷值�
   仅续写事件聚合长度不同（16 / 48 / 112 / 240 事件）。
 - GT 侧无随机种子：152 个滑窗窗口（训练 128 / 验证 10 / 外部 14）由 MP3→BasicPitch 转录 MIDI
   与固定滑窗规则确定；降维随机性由 UMAP random_state=42 与 openTSNE random_state=42 固定。
+
+### 8.8 绘图可复现性核验（同分支实测）
+
+- 固定随机源：UMAP `random_state=42`、openTSNE `random_state=42`、均 `n_jobs=1`；
+  输入侧无任何随机性——GT 由固定 MIDI + 固定滑窗（256/256）确定，
+  生成样本直接只读 `e5_events.jsonl` 中已落盘的 prompts / 事件序列（不重新采样）。
+- 实测：连续两次运行 `visualize_fullsong_reduction.py`，8 张 PNG 的 MD5 **逐字节完全一致**
+  （如 umap_len256=C4D1F739631534B9…，tsne_len256=F72AF546BA7A66AE…），
+  即"再次运行绘图脚本不会得到不一样的图"。
+- 例外提醒：若手工改动 GT 滑窗参数（`--window-size` / `--stride`）、`reduction` 超参，
+  或更换 openTSNE / umap-learn 版本，嵌入会变，图也会随之改变（属预期变更）。
