@@ -1045,3 +1045,32 @@ len=128 的 MusicMamba 最散最远，与 §7.7 该长度 mode/composite 谷值�
 且短长度统计噪声高；本图仅供定性辅助校验，不能替代 E5 窗口粒度定量评估。
 仍为仅后处理：无训练、无重新推理，jsonl 只读；不合并回 E5 主线。
 图像解读交由实验人员根据实际结果完成，脚本不预设任何预期结果。
+
+### 8.7 生成图像的样本种子溯源（补充记录）
+
+此前 §8 / §8.6 仅笼统写了"2 模型 × 3 种子 × 10 验证窗口"，未写明种子取值与每图点数构成。
+此处据 `results/e5/e5_events.jsonl` 实际记录逐项补齐（脚本运行已自动打印该表，可直接复核）：
+
+**每张图（每个 target_len 的 UMAP / t-SNE 各一张）上的生成点数 = 60 点**：
+
+| 模型 | 训练种子 | 点数 | 验证窗口（去重） | 采样 rng_seed 去重数 |
+|---|---|---|---|---|
+| BoYaTCN | 2026 | 10 | 10 | 6 |
+| BoYaTCN | 2027 | 10 | 10 | 6 |
+| BoYaTCN | 2028 | 10 | 10 | 6 |
+| MusicMamba | 2026 | 10 | 10 | 6 |
+| MusicMamba | 2027 | 10 | 10 | 6 |
+| MusicMamba | 2028 | 10 | 10 | 6 |
+
+说明：
+- 训练种子 **2026 / 2027 / 2028**（BoYaTCN 引用 E3-L3 `checkpoints/e3/L3_seed*/best_valloss_model.pt`；
+  MusicMamba 引用本 E5 补训 `checkpoints/e5/musicmamba/L3_seed*/best_valloss_model.pt`）。
+- 10 个验证窗口 = dapu14kouhuangtian w0~w3（4 个）+ dapu15wujinjiao w0~w5（6 个），
+  窗口号按曲目各自编号，故"仅按 window_index 去重"会误算成 6 个，应以 (曲目, 窗口号) 去重为准。
+- 采样 rng_seed 在每组 10 条记录中去重后为 6 个（非 10），即同一 (模型, 训练种子) 内存在 rng_seed 复用的情况；
+  该现象源自 E5 生成阶段的 rng_seed 分配（与 E5 主实验共用同一批 `e5_events.jsonl` 记录），
+  本分支仅只读引用，未做任何改动；如实记录，待 E5 主线如需复核生成阶段随机性。
+- 四个 target_len（32/64/128/256）的构成完全相同（均为上述 6 组 × 10 点 = 60 点），
+  仅续写事件聚合长度不同（16 / 48 / 112 / 240 事件）。
+- GT 侧无随机种子：152 个滑窗窗口（训练 128 / 验证 10 / 外部 14）由 MP3→BasicPitch 转录 MIDI
+  与固定滑窗规则确定；降维随机性由 UMAP random_state=42 与 openTSNE random_state=42 固定。

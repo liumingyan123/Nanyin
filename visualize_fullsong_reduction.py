@@ -452,6 +452,25 @@ def main() -> int:
 
         print(f"[fullsong-vis] target_len={L}: 生成样本 {len(gen)} 条"
               f"（续写 {int(L) - skip_prompt} 事件整体聚合）")
+        # 种子/组构成留痕：保证每张图的样本来源可追溯
+        comp: dict = {}
+        for s in gen:
+            comp[(s["category"], s["seed"])] = comp.get((s["category"], s["seed"]), 0) + 1
+        print(f"    训练种子: {sorted({sd for _, sd in comp})}"
+              f"；模型×种子组数 {len(comp)}，每组点数 {sorted(set(comp.values()))}")
+        for (mdl, sd) in sorted(comp):
+            pair_sel = [(str(r.get("song_id")), int(r.get("window_index", -1)))
+                        for r in records
+                        if int(r.get("target_len", -1)) == int(L)
+                        and str(r.get("model_name")) == mdl
+                        and int(r.get("model_seed", -1)) == sd]
+            n_win = len(set(pair_sel))          # 验证窗口按 (曲目, 窗口号) 去重
+            n_rng = len({r.get("rng_seed") for r in records
+                         if int(r.get("target_len", -1)) == int(L)
+                         and str(r.get("model_name")) == mdl
+                         and int(r.get("model_seed", -1)) == sd})
+            print(f"      {mdl} seed={sd}: {comp[(mdl, sd)]} 点"
+                  f"（去重验证窗口 {n_win} 个 / 采样 rng_seed 去重 {n_rng} 个）")
         print(f"    原始 46 维空间 · 到南音 GT 质心欧氏距离（客观数值，不含解读）：")
         for cat in CATEGORY_ORDER:
             arr = np.asarray([s["feat"] for s in gen if s["category"] == cat])
