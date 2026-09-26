@@ -713,8 +713,13 @@ def _plot_reduction(result: Dict[str, Any], cfg: dict) -> List[Dict[str, Any]]:
     Xs = StandardScaler().fit_transform(X)
     print(f"[E5-eval] 任务C 样本数 = {len(samples)}（含同起点等长 GT 区域）")
 
-    colors = {"GT": "#444444", "boyatcn": "#1f77b4", "musicmamba": "#ff7f0e"}
-    markers = {"32": "o", "64": "s", "128": "^", "256": "D"}
+    # 视觉编码：**颜色 = 续写长度**，**形状 = 模型/来源**（GT 用星形并加黑边区分）
+    groups = sorted({s["group"] for s in samples}, key=lambda g: int(g))
+    palette = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3", "#937860", "#DA8BC3"]
+    colors = {g: palette[i % len(palette)] for i, g in enumerate(groups)}
+    markers = {"GT": "*", "boyatcn": "o", "musicmamba": "^"}
+    sizes = {"GT": 130, "boyatcn": 32, "musicmamba": 38}
+    sources = ("GT", "boyatcn", "musicmamba")
     u = rcfg["umap"]
     t = rcfg["tsne"]
 
@@ -727,36 +732,47 @@ def _plot_reduction(result: Dict[str, Any], cfg: dict) -> List[Dict[str, Any]]:
     xy_t = tt.fit_transform(Xs)
 
     def _draw(xy: np.ndarray, title: str, path: str) -> None:
-        fig, ax = plt.subplots(figsize=(8.0, 6.4), dpi=160)
-        for source in ("GT", "boyatcn", "musicmamba"):
-            for grp in sorted({s["group"] for s in samples}):
+        from matplotlib.lines import Line2D
+
+        fig, ax = plt.subplots(figsize=(8.6, 6.4), dpi=160)
+        for source in sources:
+            for grp in groups:
                 idx = [i for i, s in enumerate(samples)
                        if s["source"] == source and s["group"] == grp]
                 if not idx:
                     continue
                 ax.scatter(xy[idx, 0], xy[idx, 1],
-                           s=26 if source != "GT" else 46,
-                           c=colors[source], marker=markers.get(grp, "o"),
+                           s=sizes[source], c=colors[grp], marker=markers[source],
                            alpha=0.85 if source != "GT" else 0.95,
-                           edgecolors="white" if source == "GT" else "none",
-                           linewidths=0.6, label=f"{source} len={grp}")
+                           edgecolors="black" if source == "GT" else "white",
+                           linewidths=0.5, zorder=3 if source == "GT" else 2)
+        # 双图例：颜色=续写长度，形状=来源
+        h_color = [Line2D([], [], marker="o", ls="", color=colors[g], markersize=8,
+                          label=f"len={g}") for g in groups]
+        h_marker = [Line2D([], [], marker=markers[s], ls="", color="#333333",
+                           markersize=11 if s == "GT" else 8,
+                           label=("GT (ground truth)" if s == "GT" else s)) for s in sources]
+        leg1 = ax.legend(handles=h_color, title="Length (color)", fontsize=8,
+                         title_fontsize=8, loc="upper left", framealpha=0.9)
+        ax.add_artist(leg1)
+        ax.legend(handles=h_marker, title="Source (marker)", fontsize=8,
+                  title_fontsize=8, loc="lower left", framealpha=0.9)
         ax.set_title(title, fontsize=11)
         ax.set_xlabel("dim 1")
         ax.set_ylabel("dim 2")
         ax.grid(alpha=0.25)
-        ax.legend(fontsize=7, ncol=3, loc="best")
         fig.tight_layout()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        fig.savefig(path)
+        fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
         print(f"[E5-eval] 降维图: {path}")
 
     umap_png = os.path.join(_SCRIPT_DIR, str(out["umap_png"]))
     tsne_png = os.path.join(_SCRIPT_DIR, str(out["tsne_png"]))
-    _draw(xy_u, "E5 Task C - UMAP of 46-dim symbolic features "
-                "(n_neighbors=8, min_dist=0.1, seed=42)", umap_png)
-    _draw(xy_t, "E5 Task C - t-SNE of 46-dim symbolic features "
-                "(perplexity=5, init=pca, max_iter=2000, seed=42)", tsne_png)
+    _draw(xy_u, "UMAP of 46-dim features (color = length, marker = source)",
+          umap_png)
+    _draw(xy_t, "t-SNE of 46-dim features (color = length, marker = source)",
+          tsne_png)
 
     return _cluster_info(samples, xy_u, "umap") + _cluster_info(samples, xy_t, "tsne")
 

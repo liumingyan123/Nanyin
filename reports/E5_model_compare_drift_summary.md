@@ -178,11 +178,13 @@
 
 ![UMAP](e5/e5_umap_46d.png)
 **`reports/e5/e5_umap_46d.png`** — 46 维符号特征经 StandardScaler 后 UMAP 投影。
-颜色：深灰 = 验证窗口 GT，`蓝 = BoYaTCN`，`橙 = MusicMamba`；标记形状区分续写长度
-（圆 = 32，方 = 64，三角 = 128，菱形 = 256）。每类 30 个生成样本 + 10 个 GT 点。
+**视觉编码：颜色 = 续写长度**（蓝 = 32，橙 = 64，绿 = 128，红 = 256），
+**形状 = 来源/模型**（星形 = 验证窗口 GT 真值，黑边加大；圆 = BoYaTCN；三角 = MusicMamba）。
+每模型每长度 30 个生成样本（3 籽 × 10 窗口），每长度 10 个等长截取 GT 点。
 
 ![t-SNE](e5/e5_tsne_46d.png)
-**`reports/e5/e5_tsne_46d.png`** — 同一批特征的 t-SNE 投影（perplexity=5，init=pca，2000 次迭代）。
+**`reports/e5/e5_tsne_46d.png`** — 同一批特征、同一编码方案的 t-SNE 投影
+（perplexity=5，init=pca，2000 次迭代）。
 
 ### 各类簇中心到**同长度 GT 簇中心**的距离（降维空间欧氏距离）
 
