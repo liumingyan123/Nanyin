@@ -946,3 +946,64 @@ len=128 的 MusicMamba 最散最远，与 §7.7 该长度 mode/composite 谷值�
 **图表**：`reports/e5/e5_drift_lines.png`、`reports/e5/e5_umap_46d.png`、`reports/e5/e5_tsne_46d.png`
 
 **报告**：`reports/E5_model_compare_drift_summary.md`
+
+---
+
+## 8. E5 补充校验：整曲粒度 46 维特征降维可视化（分支 feature/e5-fullsong-vis_check）
+
+**分支用途**：仅新增后处理校验可视化。无训练、无微调、无重新推理生成；
+不修改任何既有业务脚本（generate_music.py / evaluate_e4_sampling.py / visualize_embedding.py 均保持原样）；
+不改动 E5 主实验图 e5_umap_46d.png / e5_tsne_46d.png；E5 原有全部实验结论保持不变。
+**不合并回 experiment/E5_model_compare_drift 主线。**
+
+### 8.1 数据与口径（全部只读）
+
+- 生成样本：只读 `results/e5/e5_events.jsonl`，仅取 target_len=256 记录（60 条 =
+  2 模型 × 3 种子 × 10 验证窗口），丢弃前 16 个 prompt 事件，对剩余 240 个续写事件
+  做全局聚合统计（1 条记录 = 图上 1 点）。不使用 32/64/128（短序列统计噪声过高）。
+- GT 真值（完整乐曲，1 首 = 1 条 46 维特征 = 图上 1 点）：
+  南音训练集 9 首（output/BasicPitch/dapu01,02,03,04,05,06,10,12,13）、
+  南音验证集 2 首（dapu14, dapu15）、外部非南音 2 首（`古典曲/` 目录 MIDI）。
+  南音走 `dataset_nanyin.encode_song_events`，外部走 pretty_midi 解析；
+  两者均经 `CompoundEventCodec.encode_notes` 编码为复合事件序列，特征空间与生成样本一致。
+- 46 维特征全部复用 `symbolic_features.extract_symbolic_features`；
+  运行时校验 pitch-class 直方图分量求和 = 1.000000（概率归一化，消除事件总数带来的计数偏差）。
+- 调式分量：曲目级 `estimate_mode_from_pitch → resolve_mode_pcs`（GT 与生成样本同口径）。
+
+### 8.2 降维规则（fit 仅用 GT）
+
+- StandardScaler / UMAP / t-SNE **仅用 13 条完整乐曲 GT 特征向量 fit**；
+  生成样本 60 条用 transform 投射进已拟合空间，禁止全体混在一起重新 fit。
+- 超参严格沿用 configs/e5_model_drift.yaml：UMAP(n_neighbors=8, min_dist=0.1, seed=42)、
+  t-SNE(perplexity=5, max_iter=2000, init=pca, seed=42)。
+- 实现说明：sklearn TSNE 不提供 out-of-sample transform，t-SNE 侧改用 openTSNE
+  （TSNEEmbedding.transform，openTSNE 1.0.4，本分支新装依赖）；UMAP 侧为 umap-learn 原生 transform。
+  ⚠ GT 仅 13 个点 < perplexity=5×3 邻居需求，openTSNE 自动将有效 perplexity 降至 4.0（有运行时警告）。
+
+### 8.3 客观数值（原始 46 维空间 · 到南音 GT 质心欧氏距离；仅记录，不做主观解读）
+
+| 类别 | mean | min | max | n |
+|---|---|---|---|---|
+| GT 南音训练集 | 0.2363 | 0.1816 | 0.3657 | 9 |
+| GT 南音验证集 | 0.3270 | 0.2869 | 0.3670 | 2 |
+| GT 外部非南音 | 1.1134 | 0.9452 | 1.2816 | 2 |
+| BoYaTCN 续写(240事件) | 0.4204 | 0.2586 | 0.8046 | 30 |
+| MusicMamba 续写(240事件) | 0.4221 | 0.2164 | 0.6153 | 30 |
+
+### 8.4 输出图（视觉编码：颜色 = 数据类别/模型；形状 = GT(圆) vs BoYaTCN(三角) vs MusicMamba(方)）
+
+- `reports/e5/e5_fullsong_umap_check.png`
+- `reports/e5/e5_fullsong_tsne_check.png`
+
+**图注（客观局限性，必须随图引用）**：生成样本为"单 prompt 引出的 240 事件续写片段"全局特征，
+并非真正完整原曲；GT 为完整乐曲全局特征，二者原始序列长度不一致；GT 仅 13 个 fit 点，
+降维几何不稳定；本图仅作定性辅助校验，**不能替代 E5 窗口粒度定量评估**。
+本分支仅做后处理可视化，E5 原有实验结论保持不变。图像解读交由实验人员根据实际结果完成，
+脚本不预设"GT 聚集 / 生成靠近 GT"等任何预期。
+
+### 8.5 本分支产物清单
+
+- 新增脚本：`visualize_fullsong_reduction.py`（唯一新增代码文件，可独立运行：
+  `venv\Scripts\python.exe visualize_fullsong_reduction.py`）
+- 新增图片：`reports/e5/e5_fullsong_umap_check.png`、`reports/e5/e5_fullsong_tsne_check.png`
+- 新装依赖：openTSNE 1.0.4（仅本分支 t-SNE transform 需要，不影响 E5 主线复现）
