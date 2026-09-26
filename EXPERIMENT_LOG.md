@@ -1007,3 +1007,41 @@ len=128 的 MusicMamba 最散最远，与 §7.7 该长度 mode/composite 谷值�
   `venv\Scripts\python.exe visualize_fullsong_reduction.py`）
 - 新增图片：`reports/e5/e5_fullsong_umap_check.png`、`reports/e5/e5_fullsong_tsne_check.png`
 - 新装依赖：openTSNE 1.0.4（仅本分支 t-SNE transform 需要，不影响 E5 主线复现）
+
+### 8.6 版本更新：GT 改为 256 事件非重叠滑窗 + 多 target_len 循环绘图（同分支二次提交）
+
+**改动内容**（仅修改本分支新增脚本 visualize_fullsong_reduction.py，其他仓库文件零改动）：
+
+1. GT 样本：取消"整曲单点"策略，更换为 **256 事件非重叠滑窗**（window_size=256、
+   stride=256，与 E5 主实验 / 训练阶段滑窗规则一致，不足 256 的尾段直接丢弃）。
+   南音训练集、验证集、外部非南音曲目**全部**滑窗，每个窗口独立计算 46 维特征，
+   **1 个滑窗窗口 = 1 个 GT 点**。得 GT 点 152 个：
+   南音训练集 128 窗 / 南音验证集 10 窗（与 E5 主实验 10 个验证窗口口径吻合）/
+   外部非南音 14 窗。
+2. 生成样本聚合逻辑**保持不变**：丢弃前 16 个 prompt 事件，整条续写全部事件聚合为
+   一组 46 维特征；一次续写只输出 1 个点，续写内不分段。
+3. 降维拟合源更新：StandardScaler / UMAP / t-SNE 在**全部 152 个滑窗 GT 样本上 fit**；
+   生成样本 transform 投射，不参与拟合。超参维持 E5 配置不变（UMAP n_neighbors=8,
+   min_dist=0.1, seed=42；t-SNE perplexity=5, max_iter=2000, init=pca, seed=42，
+   仍经 openTSNE 实现 out-of-sample transform）。
+4. 多长度循环绘图：target_len ∈ [32, 64, 128, 256]，每个长度独立一对 UMAP / t-SNE 图，
+   四个长度**复用同一套**已 fit 好的 scaler 与降维模型。
+   图片：`reports/e5/e5_sliding_umap_len{32,64,128,256}_check.png`、
+   `reports/e5/e5_sliding_tsne_len{32,64,128,256}_check.png`（共 8 张）。
+   上一版"整曲单点"口径的 e5_fullsong_*_check.png 两张图已从本分支删除（被本版取代）。
+
+**客观数值**（原始 46 维空间 · 到南音滑窗 GT 质心欧氏距离均值；仅记录，不做主观解读）：
+
+| target_len（续写事件数） | BoYaTCN mean | MusicMamba mean |
+|---|---|---|
+| 32（16 事件） | 0.8410 | 0.8351 |
+| 64（48 事件） | 0.6143 | 0.5947 |
+| 128（112 事件） | 0.5255 | 0.5922 |
+| 256（240 事件） | 0.4185 | 0.3999 |
+
+**口径说明与局限性（随图引用）**：GT = 256 事件非重叠滑窗窗口全局统计；
+生成样本 = 单 prompt 引出的一条续写整体聚合统计（续写内不分段，1 条 = 1 点）。
+各 target_len 下续写事件数（16/48/112/240）与 GT 窗口 256 事件不等长，
+且短长度统计噪声高；本图仅供定性辅助校验，不能替代 E5 窗口粒度定量评估。
+仍为仅后处理：无训练、无重新推理，jsonl 只读；不合并回 E5 主线。
+图像解读交由实验人员根据实际结果完成，脚本不预设任何预期结果。
