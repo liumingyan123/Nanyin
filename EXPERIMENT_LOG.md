@@ -1110,3 +1110,92 @@ len=128 的 MusicMamba 最散最远，与 §7.7 该长度 mode/composite 谷值�
 各自形成互不相连的紧凑点簇，均远离南音 GT 主簇；其中八荣八耻歌与解放军军歌在 46 维空间中
 相对更接近（0.73），UMAP 中两者位于图的两侧、并未混簇。图像解读由实验人员完成，
 本分支仅客观记录；仍为仅后处理，无训练、无重生成，不合并回 E5 主线。
+
+---
+
+## 9. MusicMamba「同等网络改动」移植任务 —— 前提核实与归档（结论：无需移植，不新建分支）
+
+> 本节记录于 `feature/e5-fullsong-vis_check` 分支（归档分支 `experiment/E5_model_compare_drift` 禁止改动，
+> 故记录落在本分支 EXPERIMENT_LOG.md）。本次**未新建 mamba-same-mod 分支、未重训、未改动任何模型代码**。
+
+### 9.1 分支名映射（仓库实际名称；不存在名为 experiment/E2 或 experiment/E3-L3 的分支）
+
+| 任务描述中的名称 | 仓库实际对象 |
+|---|---|
+| `experiment/E2` | `feature/E2_compound_window`（BoYaTCN 基线） |
+| `experiment/E3-L3` | `experiment/E3_loss_ablation` 分支 + `configs/e3_L3.yaml` |
+| `experiment/E4_sampling_search` | 同名分支，一致 |
+| `experiment/E5_model_compare_drift` | 同名分支，一致（HEAD `d449802`，未改动） |
+
+### 9.2 ① 过滤后的纯净网络 diff（E2 → E3-L3，仅保留 models.py）
+
+过滤剔除数据集 / 训练脚本 / 损失 / yaml / 日志 / 输出 / 测试后，`models.py` 上只剩**一项改动**：
+**停用 `features_head`（MFCC 回归头）与 `style_head`（随机投影风格头）两个独立辅助头**。
+共 4 处 hunk，两个模型类**各 2 处、内容对称**：
+
+| # | 位置（E5 行号） | 改动内容 | 设计意图 | TCN 特有？ |
+|---|---|---|---|---|
+| 1 | `NanyinBoYaTCN.__init__` 387-388, 499-502 | 新增开关 `use_features_head=False` / `use_style_head=False`；两个头改为 `nn.Linear(...) if flag else None` | E3 要求所有南音分布约束损失必须基于模型**最终生成输出**（pitch_head / duration_head / shift_head 的 logits），不再经由与生成无关的独立辅助头间接约束；默认关闭后两头不创建、不参与前向、无参数 | **否**（纯输出头开关，与骨干无关） |
+| 2 | `NanyinBoYaTCN.forward` 600-603 | `pred_features` / `pred_style` 置 None（返回字典保留键、值为 None） | 保持返回结构不变，老链路 / 风格损失做 None 兜底记 0，不报错 | **否** |
+| 3 | `NanyinMusicMamba.__init__` 671-672, 755-758 | 与 #1 **完全相同** | 同 #1 | **否** |
+| 4 | `NanyinMusicMamba.forward` 829-832 | 与 #2 **完全相同** | 同 #2 | **否** |
+
+**行级取证**（`git diff feature/E2_compound_window..experiment/E5_model_compare_drift -- models.py`，增删行去重后共 4 删 / 24 增，全部与辅助头相关，无一处涉及骨干）：
+
+删除：`self.features_head = nn.Linear(d_model, feat_dim)`、`self.style_head = nn.Linear(d_model, style_dim)`、
+`pred_features = self.features_head(x_global)`、`pred_style = F.normalize(self.style_head(x_global), p=2, dim=-1)`
+新增：`use_features_head: bool = False`、`use_style_head: bool = False`、
+`self.features_head = nn.Linear(d_model, feat_dim) if use_features_head else None`、
+`self.style_head = nn.Linear(d_model, style_dim) if use_style_head else None`、
+`pred_features = self.features_head(x_global) if self.features_head is not None else None`、
+`pred_style = (F.normalize(...) if self.style_head is not None else None)`、以及对应中文注释。
+
+### 9.3 核心核实结论：MusicMamba 已同步收到该改动，无可移植内容
+
+1. 该改动出自唯一提交 `da8c9b2`（`git log --all -S"features_head"` 可复现）；
+   diff 显示**同一提交内同时修改 `NanyinBoYaTCN` 与 `NanyinMusicMamba`**。
+2. `git diff --stat` 证明：E2→E5 的 `models.py` 改动量 = E2→E3 的改动量（均 32 增 / 8 删），
+   即 E4（采样搜索）、E5（模型对比）**未再引入任何网络改动**。
+3. `configs/e3_L3.yaml` 全文无 `model:` 段，纯 loss / 训练 / 数据 / 路径配置，**不含结构参数**。
+4. 运行时验证（当前代码）：两个类的 `features_head` / `style_head` **均为 None**，
+   `forward` 返回 `pred_features=None`、`pred_style=None`。
+5. 全仓检索：除 `models.py` 定义处外，**无任何代码传入 `use_*_head=True`**，无重新开启路径。
+6. 已排查全部 9 个本地分支、`git stash`、工作区、`backup_pre_causal/models.py`，未发现其他主干网络改动来源。
+
+**结论**：E5 基线现状即 **BoYaTCN(改) vs MusicMamba(改)**，任务前提「MusicMamba 主干仍为原生版本、
+未移植 E3-L3 网络改动」在仓库中不成立；E2→E3 也**不存在任何 TCN 架构特有模块**
+（卷积 / 膨胀 / 因果掩码 / 残差 / 归一化 / 层数维度）可供平移。
+故本次**不做移植、不新建分支、不重训**——继续只能靠编造逻辑或新增模型优化，二者均在禁止清单内。
+
+### 9.4 ③ 移植核对检查清单（本次以"现状核对"形式出具）
+
+| 检查项 | 结论 | 证据 |
+|---|---|---|
+| E3-L3 网络改动已完整落实到 BoYaTCN | ✅ | E5 `models.py` 387-388/499-502/600-603 |
+| E3-L3 网络改动已完整落实到 MusicMamba | ✅ 已落实，无需再移植 | E5 `models.py` 671-672/755-758/829-832，与 BoYaTCN 对称 |
+| 无 TCN 特有结构改动遗漏 | ✅ | E2→E3 `models.py` 无任何骨干层改动 |
+| 未混入数据集 / loss / yaml 配置类变更 | ✅ | 本次零代码改动；且过滤后 diff 仅 models.py |
+| E5 训练 / 推理 / 数据 / 采样配置完整保留 | ✅ | 工作区干净，未触碰 `configs/e5_model_drift.yaml`、`train_boyatcn.py`、`generate_music.py` 等 |
+| 归档分支 E5 未被改动 | ✅ | HEAD 仍为 `d449802`，`git status` 干净 |
+| 未新建 mamba-same-mod 分支 | ✅ | `git branch --list mamba-same-mod` 为空 |
+| 未执行训练 / 推理 | ✅ | 本次仅 git 取证 + 1 次无副作用的模型实例化验证 |
+
+### 9.5 ④ 训练命令（仅供将来"复现性重训"参考，非新对照组）
+
+严格对齐 E5（数据 / 损失 / 早停 / 采样全部沿用 E5 配置）：
+
+```
+venv\Scripts\python.exe train_boyatcn.py --mode compound --model musicmamba \
+    --config configs/e3_L3.yaml --checkpoint-dir checkpoints/e5/musicmamba/L3_seed2026 --seed 2026
+```
+（2027 / 2028 同法；早停 `early_stop_patience=20`，best-val 存 `best_valloss_model.pt`；
+推理采样 T=1.0、top-p=0.95、top-k=0，与 E5 一致。）
+⚠ 该命令会**复现** E5 的 MusicMamba（模型定义与 E5 相同），属可复现性验证，**不构成新的对照组**。
+
+### 9.6 ⑤ 权重可复用性与重训必要性
+
+- 一般规则：主干网络一旦发生实质改动，旧权重（张量形状 / 层数 / 参数语义）即失效，必须**从零完整重训**，
+  不可复用、不可部分加载。
+- 本次适用结论：MusicMamba 的 E5 权重（`checkpoints/e5/musicmamba/L3_seed*`）本就是**含该改动的网络定义**
+  训练所得，因此**当前无需重训、权重可直接用于 E5 基线对照**。
+- 若后续真要引入新的结构性改动，则 2026/2027/2028 三籽必须全部重训，且旧权重全部作废、需另行归档。
