@@ -1,0 +1,3 @@
+﻿*.wav
+*.tmp_render.wav
+!mapping_e5_seed2026.csv

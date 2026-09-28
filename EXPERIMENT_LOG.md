@@ -946,3 +946,86 @@ len=128 的 MusicMamba 最散最远，与 §7.7 该长度 mode/composite 谷值�
 **图表**：`reports/e5/e5_drift_lines.png`、`reports/e5/e5_umap_46d.png`、`reports/e5/e5_tsne_46d.png`
 
 **报告**：`reports/E5_model_compare_drift_summary.md`
+
+---
+
+## 10. E5 · len256 / seed2026 · 四声部合奏音频渲染（纯后处理，无训练/无评估）
+
+- 分支：`experiment/E5_model_compare_drift`（HEAD `d449802`，本任务沿用 §9 归档结论：BoYaTCN 与 MusicMamba 均为"停用 features_head/style_head"后的同一网络口径）。
+- 性质：**仅 MIDI→音频渲染**。未运行训练、未运行推理生成、未运行评估、未绘图，未修改任何模型/训练/评估/渲染源代码。
+
+### 10.1 输入（只读）
+
+`results/e5/generated_midi/*_seed2026_len256.mid`，筛选 `seed=2026 && target_len=256`，
+覆盖 BoYaTCN / MusicMamba 两模型 × 10 个验证窗口（dapu14kouhuangtian w0–w3，dapu15wujinjiao w0–w5）= **20 条**。
+已排除 seed=2027/2028 与 len=32/64/128。原始 MIDI 只读，校验：文件名与修改时间未变（9/26 生成，任务期间未写）。
+
+### 10.2 渲染管线（严格沿用 V4）
+
+与 V4 原版驱动 `/root/tokensynth/render_ens_v4_newmidi.sh`、`render_all_v4d.sh` 一致：
+
+```
+# 1) V4 后置派生：基础主声部 pipa，据此派生 dongxiao / erxian / sanxian（参数一律默认，--late-join 0）
+/root/tokensynth_env/bin/python derive_ensemble_v4.py --midi <主干>.mid --outdir <四声部目录> --late-join 0
+
+# 2) TokenSynth 逐轨渲染（每轨独立进程、每轨 --seed 2024）
+/root/tokensynth_env/bin/python ts_render_full.py --ref refs/ref_<inst>.wav --midi <inst>.mid \
+    --out ens_<inst>.wav --seed 2024 --top_k 10 --win 5.0 --device cuda
+
+# 3) V4 混音（权重写死在 mix_ensemble.py 内，未改动）
+/root/tokensynth_env/bin/python mix_ensemble.py --indir <tracks> --out <mix>.wav --prefix ens_
+```
+
+批量驱动脚本：`audio_e5_seed2026/render_e5_seed2026.sh`（WSL/tmux 后台跑，支持断点续跑）。
+渲染环境：WSL Ubuntu + RTX 3060 Laptop（CUDA），torch 2.5.1+cu124。
+
+**为什么不用 `ts_render_multi.py`**：multi 版是"单次播种 + RNG 状态跨任务连续"，某轨音频会依赖前序任务的随机流；
+而 V4 原版（含 GT 侧 `render_all_v4d.sh` 与生成侧 `render_ens_v4_newmidi.sh`）均为 `ts_render_full.py`
+**每轨独立进程、每轨从 `--seed 2024` 重新播种**。为"严格对齐 V4"，本任务采用后者。
+（中途曾误用 multi 渲了 1 轨，已停止会话、删除该批半成品后整体重跑，避免两种 RNG 机制混用。）
+
+**V4 配置逐项未改动**：参考音色 `refs/ref_{pipa,dongxiao,sanxian,erxian}.wav`；`--seed 2024`；
+`--top_k 10`；`--win 5.0`；**未传 `--norm_peak`**（与 V4 历史行为完全一致）；
+混音权重 `pipa 1.0 / dongxiao 0.9 / sanxian 0.7 / erxian 0.8`（含逐轨 RMS 归一化 + 整体峰值 0.9 归一化）；
+未新增乐器、未调整声部分配与增益。
+
+> 注：派生阶段"基础主声部 = 琵琶"，后置叠加的声部在 V4 代码中的产出顺序为
+> `dongxiao → erxian → sanxian`（写入顺序 pipa/dongxiao/sanxian/erxian），
+> 混音叠加顺序见 `mix_ensemble.py` 的 `INSTS = [pipa, dongxiao, sanxian, erxian]`。此处完全照搬代码，未作调整。
+
+### 10.3 产出
+
+| 项 | 数量 | 路径 |
+|---|---|---|
+| 分轨 wav（ens_pipa / ens_dongxiao / ens_sanxian / ens_erxian） | 20 × 4 = **80** | `audio_e5_seed2026/tracks/<stem>/` |
+| 合奏混音 wav | **20** | `audio_e5_seed2026/mix/<stem>_ensemble.wav` |
+| 派生四声部 MIDI | 20 × 4 | `audio_e5_seed2026/ensemble_midi/<stem>/` |
+| 听测索引表 | CSV + MD | `audio_e5_seed2026/mapping_e5_seed2026.{csv,md}` |
+
+16 kHz / int16（`ts_render_full.py` 原生写盘格式）。
+渲染起止：`2026-09-28 16:00:21 → 20:25:13`（约 4h25m，80 轨 + 20 次混音）。
+**wav 未入版本库**：输出目录内含独立 `.gitignore`（`*.wav`），提交时仅收录脚本、索引表与日志。
+
+### 10.4 结果核验
+
+| 检查项 | 结果 |
+|---|---|
+| 混音文件数 | 20 / 20，全部非空（1.44–2.08 MB） |
+| 空文件（<10 KB） | 0 |
+| 缺轨 / 缺派生 MIDI | 0（`[缺轨]`、`[缺inst midi]` 计数为 0） |
+| 派生失败 | 0（`derive rc=0` 全部） |
+| 渲染退出码 | 全部 `rc=0` |
+
+### 10.5 客观局限（务必连同音频一起阅读）
+
+1. **峰值告警是 V4 原生行为**：日志出现 **60 次** `WARN 整曲峰值 x.xxx > 1.0`（如 1.007 / 1.015），
+   因为 V4 驱动同样不传 `--norm_peak`。这意味着**个别分轨 wav 可能存在轻微 int16 削波**；
+   这是与 V4 历史产物一致的行为，本次未擅自改动。
+   混音端已由 `mix_ensemble.py` 做逐轨 RMS 归一化 + 整体峰值归一到 0.9，**合奏混音文件峰值 ≤ 0.9，不存在削波**。
+2. **本批音频仅用于人工听测/定性参考**，不代表任何新的定量结论；未做 FAD、未做盲听统计、未做音频指标计算。
+   E5 原有的符号层定量结论（§5 任务 A/B/C）**完全不变**。
+3. 渲染对象为 `target_len=256` 的**续写片段**（约 45–62 s），不是完整原曲；
+   与"整曲 GT 合奏"在时长与结构上不可直接比较。
+4. 仅 seed=2026 单籽样本，不能据此推断另两籽（2027/2028）的听感表现。
+5. TokenSynth 为神经合成器，其音色/质感不等于真实南音乐器演奏；叠加声部由 `derive_ensemble_v4.py`
+   规则派生，非真实编配。
